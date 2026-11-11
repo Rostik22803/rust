@@ -106,6 +106,12 @@ local Config = {
         LongJump = false,
         LongJumpBoost = 26,         -- safe horizontal velocity (studs/s, avoids server rubberband)
         LongJumpHeight = 52,        -- vertical velocity (studs/s)
+        SpeedBoost = false,
+        SpeedValue = 25,            -- studs/s (24-28 stays safe from server rubberband)
+        Noclip = false,
+        Invisibility = false,
+        InvisMode = "FE Sink",      -- "FE Sink" | "Local"
+        InvisSinkDepth = 15,        -- studs underground during network tick
     },
     UI = {
         Open = not IsMobile,        -- on mobile start collapsed to clean OCEL pill
@@ -913,6 +919,8 @@ local SilentState = {
     RealHitsSent = {},
     LastBowDraw = 1,
     BowCalibration = nil, -- { baseSpeed, gravity, drag }
+    SpoofLookDir = nil,
+    SpoofLookUntil = 0,
 }
 
 local PredictAimPosition
@@ -1025,7 +1033,27 @@ local function IsHoldingRangedWeapon()
     return nil, false
 end
 
-local GameShared = (type(getrenv) == "function" and getrenv().shared) or shared
+local function FindGameShared()
+    if type(getrenv) == "function" then
+        local ok, env = pcall(getrenv)
+        if ok and type(env) == "table" and type(env.shared) == "table" then
+            return env.shared
+        end
+    end
+    if type(getgc) == "function" then
+        local ok, gc = pcall(getgc, true)
+        if ok and type(gc) == "table" then
+            for _, obj in ipairs(gc) do
+                if type(obj) == "table" and (rawget(obj, "HeldViewCFrame") ~= nil or rawget(obj, "SmoothLookAim") ~= nil or rawget(obj, "MovementClientScript") ~= nil) then
+                    return obj
+                end
+            end
+        end
+    end
+    return shared
+end
+
+local GameShared = FindGameShared()
 
 local RealFireServer
 do
@@ -1036,6 +1064,15 @@ do
         return f
     end)
     RealFireServer = ok and fn or nil
+end
+
+local function SyncSmoothLookDir(dir)
+    if type(GameShared.SmoothLookAim) == "table" and typeof(dir) == "Vector3" and dir.Magnitude > 0.01 then
+        local u = dir.Unit
+        GameShared.SmoothLookAim.yaw = math.atan2(-u.X, -u.Z)
+        GameShared.SmoothLookAim.pitch = math.asin(math.clamp(u.Y, -1, 1))
+        GameShared.SmoothLookAim.at = os.clock()
+    end
 end
 
 local function InstallViewSpoof()
@@ -1060,10 +1097,15 @@ local function InstallViewSpoof()
                 if tool then
                     if isBow then
                         local dir = PredictBowDirection(baseCF.Position, part, char, 1)
+                        SilentState.SpoofLookDir = dir
+                        SilentState.SpoofLookUntil = os.clock() + 0.16
                         return CFrame.lookAt(baseCF.Position, baseCF.Position + dir * 100)
                     else
                         local aimPos = PredictAimPosition(part, char)
                         if (aimPos - baseCF.Position).Magnitude > 0.5 then
+                            local dir = (aimPos - baseCF.Position).Unit
+                            SilentState.SpoofLookDir = dir
+                            SilentState.SpoofLookUntil = os.clock() + 0.16
                             return CFrame.lookAt(baseCF.Position, aimPos)
                         end
                     end
@@ -1078,9 +1120,10 @@ end
 local function InstallSilentHook()
     local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
     local safeCheckCaller = type(checkcaller) == "function" and checkcaller or function() return false end
+    local setMethod = type(setnamecallmethod) == "function" and setnamecallmethod or nil
     local sharedRegistry = getgenv and getgenv() or _G
 
-    local function silentHandler(sendFn, self, ...)
+    local function silentHandler(sendFn, isNamecall, self, ...)
         if Config.Misc.AntiAim and Config.Misc.AntiAimPitch ~= "Off" and typeof(self) == "Instance" and self.Name == "Pose" then
             local argc = select("#", ...)
             local args = { ... }
@@ -1090,15 +1133,17 @@ local function InstallSilentHook()
                     args[2] = -1.42
                 elseif pMode == "Up" then
                     args[2] = 1.42
-                else -- "Jitter"
+                else
                     args[2] = (math.floor(os.clock() * 18) % 2 == 0) and -1.42 or 1.42
                 end
+                if isNamecall and setMethod then setMethod("FireServer") end
                 return sendFn(self, table.unpack(args, 1, argc))
             end
         end
 
         local sMethod = Config.Aimbot.SilentMethod
         if sMethod == "ViewSpoof" or not Config.Aimbot.SilentAim or not SilentState.Active then
+            if isNamecall and setMethod then setMethod("FireServer") end
             return sendFn(self, ...)
         end
 
@@ -1125,6 +1170,9 @@ local function InstallSilentHook()
                         if ok and typeof(newDir) == "Vector3" and newDir.Magnitude > 0.5 then
                             args[1] = newDir
                             redirected = true
+                            SilentState.SpoofLookDir = newDir
+                            SilentState.SpoofLookUntil = os.clock() + 0.18
+                            SyncSmoothLookDir(newDir)
                         end
                     end
 
@@ -1134,8 +1182,12 @@ local function InstallSilentHook()
                         local origin = args[1]
                         local ok, aimPos = pcall(PredictAimPosition, part, char)
                         if ok and typeof(aimPos) == "Vector3" and (aimPos - origin).Magnitude > 0.5 then
-                            args[2] = (aimPos - origin).Unit
+                            local newDir = (aimPos - origin).Unit
+                            args[2] = newDir
                             redirected = true
+                            SilentState.SpoofLookDir = newDir
+                            SilentState.SpoofLookUntil = os.clock() + 0.18
+                            SyncSmoothLookDir(newDir)
 
                             local claim = args[4]
                             if type(claim) == "table" and type(claim.id) == "number" then
@@ -1151,6 +1203,7 @@ local function InstallSilentHook()
                                     local pellets = (tool and tonumber(tool:GetAttribute("C_Pellets"))) or 1
                                     pellets = math.clamp(math.floor(pellets), 1, 12)
                                     local isBatchHit = (folderName == "DoubleBarrelRemotes" or folderName == "PipePistolRemotes")
+                                    local hitSend = RealFireServer or function(rem, ...) rem:FireServer(...) end
 
                                     task.delay(waitSec, function()
                                         if SilentState.RealHitsSent[claimId] then
@@ -1159,16 +1212,18 @@ local function InstallSilentHook()
                                         end
                                         if targetPart.Parent and targetChar.Parent and hitRemote.Parent then
                                             local nowT = Workspace:GetServerTimeNow()
-                                            local hitPos = targetPart.Position
+                                            local toPart = targetPart.Position - origin
+                                            local surfOffset = (toPart.Magnitude > 1) and (toPart.Unit * math.min(targetPart.Size.X, targetPart.Size.Z) * 0.42) or Vector3.zero
+                                            local hitPos = targetPart.Position - surfOffset
                                             if isBatchHit then
                                                 local batch = {}
                                                 for pIdx = 1, pellets do
                                                     table.insert(batch, { pIdx, targetPart, hitPos, nowT })
                                                 end
-                                                sendFn(hitRemote, claimId, batch)
+                                                hitSend(hitRemote, claimId, batch)
                                             else
                                                 for pIdx = 1, pellets do
-                                                    sendFn(hitRemote, claimId, pIdx, targetPart, hitPos, nowT)
+                                                    hitSend(hitRemote, claimId, pIdx, targetPart, hitPos, nowT)
                                                 end
                                             end
                                         end
@@ -1180,8 +1235,10 @@ local function InstallSilentHook()
                 end
 
                 if redirected then
+                    if isNamecall and setMethod then setMethod("FireServer") end
                     return sendFn(self, table.unpack(args, 1, argc))
                 end
+                if isNamecall and setMethod then setMethod("FireServer") end
                 return sendFn(self, ...)
 
             elseif name == "Hit" then
@@ -1191,6 +1248,7 @@ local function InstallSilentHook()
                 end
             end
         end
+        if isNamecall and setMethod then setMethod("FireServer") end
         return sendFn(self, ...)
     end
 
@@ -1210,8 +1268,10 @@ local function InstallSilentHook()
                 local method = getnamecallmethod()
                 local old = state.old
                 if state.enabled and (method == "FireServer" or method == "fireServer") and not safeCheckCaller() then
-                    -- Use unhooked RealFireServer so inner :FindFirstChild/:GetAttribute calls never corrupt getnamecallmethod()
-                    return state.handler(RealFireServer or old, self, ...)
+                    if setMethod then
+                        return state.handler(old, true, self, ...)
+                    end
+                    return state.handler(RealFireServer or old, false, self, ...)
                 end
                 return old(self, ...)
             end))
@@ -1226,7 +1286,7 @@ local function InstallSilentHook()
             state.old = hookfunction(RealFireServer, wrap(function(self, ...)
                 local old = state.old
                 if state.enabled and not safeCheckCaller() then
-                    return state.handler(old, self, ...)
+                    return state.handler(old, false, self, ...)
                 end
                 return old(self, ...)
             end))
@@ -1471,6 +1531,9 @@ local function StepAimbot(dt)
             LockedTarget = nil
         end
         AimHasLock = false
+        if os.clock() < SilentState.SpoofLookUntil and SilentState.SpoofLookDir then
+            SyncSmoothLookDir(SilentState.SpoofLookDir)
+        end
         return
     end
 
@@ -1790,17 +1853,18 @@ local function ApplyAntiAimPose(char)
     local pMode = Config.Misc.AntiAimPitch
     local pitchRad
     if pMode == "Down" then
-        pitchRad = -1.22
+        pitchRad = -1.25
     elseif pMode == "Up" then
         pitchRad = 1.15
     else -- "Jitter"
-        pitchRad = (math.floor(os.clock() * 18) % 2 == 0) and -1.22 or 1.15
+        pitchRad = (math.floor(os.clock() * 18) % 2 == 0) and -1.25 or 1.15
     end
 
     local head = char:FindFirstChild("Head")
     local neck = head and head:FindFirstChild("Neck")
     if neck and neck:IsA("Motor6D") then
         if not MotorBackup[neck] then MotorBackup[neck] = neck.C0 end
+        neck.Transform = CFrame.identity
         neck.C0 = MotorBackup[neck] * CFrame.Angles(pitchRad, 0, 0)
     end
 
@@ -1808,7 +1872,8 @@ local function ApplyAntiAimPose(char)
     local waist = ut and ut:FindFirstChild("Waist")
     if waist and waist:IsA("Motor6D") then
         if not MotorBackup[waist] then MotorBackup[waist] = waist.C0 end
-        waist.C0 = MotorBackup[waist] * CFrame.Angles(pitchRad * 0.42, 0, 0)
+        waist.Transform = CFrame.identity
+        waist.C0 = MotorBackup[waist] * CFrame.Angles(pitchRad * 0.45, 0, 0)
     end
 end
 
@@ -1851,9 +1916,17 @@ local function StepAntiAim(dt)
     local pos = hrp.Position
     hrp.CFrame = CFrame.new(pos) * CFrame.Angles(0, AntiAimYaw, 0)
     ApplyAntiAimPose(char)
+
+    -- Sync SmoothLookAim pitch when not actively shooting Silent Aim so server replicates head pitch
+    if Config.Misc.AntiAimPitch ~= "Off" and os.clock() >= SilentState.SpoofLookUntil and type(GameShared.SmoothLookAim) == "table" and Camera then
+        local lv = Camera.CFrame.LookVector
+        GameShared.SmoothLookAim.yaw = math.atan2(-lv.X, -lv.Z)
+        GameShared.SmoothLookAim.pitch = (Config.Misc.AntiAimPitch == "Down") and -1.42 or (Config.Misc.AntiAimPitch == "Up" and 1.42 or ((math.floor(os.clock() * 18) % 2 == 0) and -1.42 or 1.42))
+        GameShared.SmoothLookAim.at = os.clock()
+    end
 end
 
--- TriggerBot (Mobile + PC via TouchInput & Bow InputBegan hook)
+-- TriggerBot (Mobile + PC: finds LIVE TouchInput table via getgc + TestForceFire + InputBegan)
 local TriggerBotPulse = false
 local TriggerHoverSince = nil
 local TriggerNextFireAt = 0
@@ -1861,31 +1934,51 @@ local TouchInputMod = nil
 local OrigIsMouseBtnPressed = nil
 local TouchBeganList = nil
 
+local function FindLiveTouchInput()
+    if type(getgc) == "function" then
+        local ok, gc = pcall(getgc, true)
+        if ok and type(gc) == "table" then
+            for _, obj in ipairs(gc) do
+                if type(obj) == "table"
+                    and type(rawget(obj, "isMouseButtonPressed")) == "function"
+                    and type(rawget(obj, "inputBegan")) == "function"
+                    and type(rawget(obj, "holdButton")) == "function" then
+                    return obj
+                end
+            end
+        end
+    end
+    local rs = game:GetService("ReplicatedStorage")
+    local modScript = rs:FindFirstChild("TouchInput")
+    if modScript and modScript:IsA("ModuleScript") then
+        local ok, mod = pcall(require, modScript)
+        if ok and type(mod) == "table" and type(mod.isMouseButtonPressed) == "function" then
+            return mod
+        end
+    end
+    return nil
+end
+
 local function InstallTriggerBotHook()
     if TouchInputMod then return end
     pcall(function()
-        local rs = game:GetService("ReplicatedStorage")
-        local modScript = rs:FindFirstChild("TouchInput")
-        if modScript and modScript:IsA("ModuleScript") then
-            local mod = require(modScript)
-            if type(mod) == "table" and type(mod.isMouseButtonPressed) == "function" then
-                TouchInputMod = mod
-                OrigIsMouseBtnPressed = mod.isMouseButtonPressed
-                mod.isMouseButtonPressed = function(btn)
-                    if TriggerBotPulse and btn == Enum.UserInputType.MouseButton1 then
-                        return true
-                    end
-                    return OrigIsMouseBtnPressed(btn)
+        local mod = FindLiveTouchInput()
+        if mod then
+            TouchInputMod = mod
+            OrigIsMouseBtnPressed = mod.isMouseButtonPressed
+            mod.isMouseButtonPressed = function(btn)
+                if TriggerBotPulse and btn == Enum.UserInputType.MouseButton1 then
+                    return true
                 end
+                return OrigIsMouseBtnPressed(btn)
+            end
 
-                -- Extract TouchInput's inputBegan listener list (v_u_25) so BowClient shoots on TriggerBot
-                local getup = getupvalues or (debug and debug.getupvalues)
-                if type(getup) == "function" and type(mod.inputBegan) == "function" then
-                    for _, uv in pairs(getup(mod.inputBegan)) do
-                        if type(uv) == "table" and type(uv[1]) == "table" and type(uv[1].fn) == "function" then
-                            TouchBeganList = uv
-                            break
-                        end
+            local getup = getupvalues or (debug and debug.getupvalues)
+            if type(getup) == "function" and type(mod.inputBegan) == "function" then
+                for _, uv in pairs(getup(mod.inputBegan)) do
+                    if type(uv) == "table" and type(uv[1]) == "table" and type(uv[1].fn) == "function" then
+                        TouchBeganList = uv
+                        break
                     end
                 end
             end
@@ -1959,12 +2052,18 @@ local function StepTriggerBot()
     if not Config.Aimbot.TriggerBot or not Camera then
         TriggerBotPulse = false
         TriggerHoverSince = nil
+        if LocalPlayer:GetAttribute("TestForceFire") == true then
+            LocalPlayer:SetAttribute("TestForceFire", false)
+        end
         return
     end
     local tool, isBow = IsHoldingRangedWeapon()
     if not tool then
         TriggerBotPulse = false
         TriggerHoverSince = nil
+        if LocalPlayer:GetAttribute("TestForceFire") == true then
+            LocalPlayer:SetAttribute("TestForceFire", false)
+        end
         return
     end
 
@@ -2009,23 +2108,28 @@ local function StepTriggerBot()
                 TriggerNextFireAt = now + 0.18
                 FireSyntheticBowShot()
             else
-                TriggerNextFireAt = now + 0.11
-                if TouchInputMod then
-                    TriggerBotPulse = true
-                    task.delay(0.045, function()
-                        TriggerBotPulse = false
-                    end)
-                elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
+                TriggerNextFireAt = now + 0.10
+                TriggerBotPulse = true
+                LocalPlayer:SetAttribute("TestForceFire", true)
+                FireSyntheticBowShot() -- also triggers DoubleBarrel / click-based guns
+                if type(mouse1press) == "function" and type(mouse1release) == "function" and not TouchInputMod then
                     pcall(mouse1press)
-                    task.delay(0.045, function()
-                        pcall(mouse1release)
-                    end)
                 end
+                task.delay(0.045, function()
+                    TriggerBotPulse = false
+                    LocalPlayer:SetAttribute("TestForceFire", false)
+                    if type(mouse1release) == "function" and not TouchInputMod then
+                        pcall(mouse1release)
+                    end
+                end)
             end
         end
     else
         TriggerHoverSince = nil
         TriggerBotPulse = false
+        if LocalPlayer:GetAttribute("TestForceFire") == true then
+            LocalPlayer:SetAttribute("TestForceFire", false)
+        end
     end
 end
 
@@ -2271,9 +2375,134 @@ local function BindLongJump(char)
     end)
 end
 
+local SpeedBoostActiveWasOn = false
+
+local function StepSpeedBoost()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp or hum.Health <= 0 then return end
+
+    if Config.Misc.SpeedBoost then
+        SpeedBoostActiveWasOn = true
+        hum.WalkSpeed = Config.Misc.SpeedValue
+        local move = hum.MoveDirection
+        if move.Magnitude > 0.1 then
+            local state = hum:GetState()
+            if state ~= Enum.HumanoidStateType.Jumping and state ~= Enum.HumanoidStateType.Freefall then
+                local cur = hrp.AssemblyLinearVelocity
+                local dir = Vector3.new(move.X, 0, move.Z).Unit
+                hrp.AssemblyLinearVelocity = Vector3.new(dir.X * Config.Misc.SpeedValue, cur.Y, dir.Z * Config.Misc.SpeedValue)
+            end
+        end
+    elseif SpeedBoostActiveWasOn then
+        SpeedBoostActiveWasOn = false
+        hum.WalkSpeed = 16
+    end
+end
+
+-- Noclip
+local NoclipBackup = setmetatable({}, { __mode = "k" })
+local NoclipWasOn = false
+
+local function RestoreNoclip()
+    for part, orig in pairs(NoclipBackup) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = orig end)
+        end
+    end
+    table.clear(NoclipBackup)
+end
+
+local function StepNoclip()
+    local char = LocalPlayer.Character
+    if not Config.Misc.Noclip then
+        if NoclipWasOn then
+            NoclipWasOn = false
+            RestoreNoclip()
+        end
+        return
+    end
+    if not char then return end
+    NoclipWasOn = true
+    for _, inst in ipairs(char:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            if NoclipBackup[inst] == nil then
+                NoclipBackup[inst] = inst.CanCollide
+            end
+            if inst.CanCollide then
+                inst.CanCollide = false
+            end
+        end
+    end
+end
+
+-- Invisibility (FE Sink underground desync on Heartbeat->First, or Local visual)
+local InvisSavedCF = nil
+local InvisWasOn = false
+
+local function RestoreInvis()
+    local char = LocalPlayer.Character
+    if InvisSavedCF and char then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.CFrame = InvisSavedCF
+        end
+    end
+    InvisSavedCF = nil
+    if InvisWasOn and char then
+        InvisWasOn = false
+        for _, inst in ipairs(char:GetDescendants()) do
+            if inst:IsA("BasePart") and inst.Name ~= "HumanoidRootPart" then
+                inst.LocalTransparencyModifier = 0
+            elseif inst:IsA("Decal") then
+                inst.Transparency = 0
+            end
+        end
+    end
+end
+
+local function StepInvisPre()
+    local char = LocalPlayer.Character
+    if not char then
+        InvisSavedCF = nil
+        return
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if InvisSavedCF and hrp then
+        hrp.CFrame = InvisSavedCF
+    end
+    InvisSavedCF = nil
+end
+
+local function StepInvisPost()
+    local char = LocalPlayer.Character
+    if not Config.Misc.Invisibility then
+        if InvisWasOn or InvisSavedCF then
+            RestoreInvis()
+        end
+        return
+    end
+    if not char then return end
+    InvisWasOn = true
+
+    if Config.Misc.InvisMode == "FE Sink" then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 then
+            InvisSavedCF = hrp.CFrame
+            hrp.CFrame = InvisSavedCF * CFrame.new(0, -Config.Misc.InvisSinkDepth, 0)
+        end
+    end
+end
+
 local function RestoreAllMisc()
     Config.Aimbot.TriggerBot = false
     TriggerBotPulse = false
+    if LocalPlayer:GetAttribute("TestForceFire") == true then
+        LocalPlayer:SetAttribute("TestForceFire", false)
+    end
     if TouchInputMod and OrigIsMouseBtnPressed then
         TouchInputMod.isMouseButtonPressed = OrigIsMouseBtnPressed
     end
@@ -2289,6 +2518,12 @@ local function RestoreAllMisc()
     Config.Misc.AntiAim = false
     StepAntiAim(0)
     RestoreAntiAimMotors(LocalPlayer.Character)
+    Config.Misc.SpeedBoost = false
+    StepSpeedBoost()
+    Config.Misc.Noclip = false
+    StepNoclip()
+    Config.Misc.Invisibility = false
+    RestoreInvis()
     Config.Misc.NoJumpCooldown = false
     StepNoJumpCooldown()
     Config.Misc.LongJump = false
@@ -2922,9 +3157,30 @@ AddToggle(MiscTabPage, "No Jump Cooldown", function() return Config.Misc.NoJumpC
     Config.Misc.NoJumpCooldown = v
     StepNoJumpCooldown()
 end)
+AddToggle(MiscTabPage, "Speed Boost", function() return Config.Misc.SpeedBoost end, function(v)
+    Config.Misc.SpeedBoost = v
+    if not v then StepSpeedBoost() end
+end)
+AddSlider(MiscTabPage, "Speed Value", 16, 42, 1, function() return Config.Misc.SpeedValue end, function(v) Config.Misc.SpeedValue = v end)
 AddToggle(MiscTabPage, "Long Jump", function() return Config.Misc.LongJump end, function(v) Config.Misc.LongJump = v end)
 AddSlider(MiscTabPage, "Long Jump Boost", 20, 42, 1, function() return Config.Misc.LongJumpBoost end, function(v) Config.Misc.LongJumpBoost = v end)
 AddSlider(MiscTabPage, "Long Jump Height", 42, 68, 1, function() return Config.Misc.LongJumpHeight end, function(v) Config.Misc.LongJumpHeight = v end)
+AddToggle(MiscTabPage, "Noclip", function() return Config.Misc.Noclip end, function(v)
+    Config.Misc.Noclip = v
+    if not v then RestoreNoclip() end
+end)
+AddToggle(MiscTabPage, "Invisibility", function() return Config.Misc.Invisibility end, function(v)
+    Config.Misc.Invisibility = v
+    if not v then RestoreInvis() end
+end)
+AddCycle(MiscTabPage, "Invis Mode", { "FE Sink", "Local" }, function() return Config.Misc.InvisMode end, function(v)
+    Config.Misc.InvisMode = v
+    if Config.Misc.Invisibility then
+        RestoreInvis()
+        Config.Misc.Invisibility = true
+    end
+end)
+AddSlider(MiscTabPage, "Invis Sink Depth", 5, 35, 1, function() return Config.Misc.InvisSinkDepth end, function(v) Config.Misc.InvisSinkDepth = v end)
 
 -- ============================================================================
 -- LIFECYCLE & RENDER STEP
@@ -3034,6 +3290,7 @@ end))
 -- Bind at Last - 1 so CameraModule & SmoothLookPost run first and AimWatchLook runs after
 local STEP_NAME = "OcelHubRenderStep"
 local POST_BODY_NAME = "OcelHubPostBody"
+local PRE_INVIS_NAME = "OcelHubPreInvis"
 local LastCounterAt = 0
 
 local function UpdatePlayerCounter()
@@ -3103,6 +3360,7 @@ RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, funct
     StepFullbright()
     StepThirdPerson()
     StepAntiAim(dt)
+    StepSpeedBoost()
     StepNoJumpCooldown()
     UpdatePlayerCounter()
 
@@ -3114,6 +3372,17 @@ RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, funct
     end
 end)
 
+RunService:BindToRenderStep(PRE_INVIS_NAME, Enum.RenderPriority.First.Value, StepInvisPre)
+
+AddConn(RunService.Heartbeat:Connect(StepInvisPost))
+
+AddConn(RunService.Stepped:Connect(function()
+    StepNoclip()
+    if Config.Misc.AntiAim and Config.Misc.AntiAimPitch ~= "Off" and LocalPlayer.Character then
+        ApplyAntiAimPose(LocalPlayer.Character)
+    end
+end))
+
 -- Runs after MovementClient's FirstPersonBody (Last.Value) so 3rd person character & head tilt stay applied
 RunService:BindToRenderStep(POST_BODY_NAME, Enum.RenderPriority.Last.Value + 1, function()
     local char = LocalPlayer.Character
@@ -3121,10 +3390,18 @@ RunService:BindToRenderStep(POST_BODY_NAME, Enum.RenderPriority.Last.Value + 1, 
     if Config.Misc.AntiAim and Config.Misc.AntiAimPitch ~= "Off" then
         ApplyAntiAimPose(char)
     end
-    if not Config.Misc.ThirdPerson then return end
+    local invis = Config.Misc.Invisibility
+    if not invis and not Config.Misc.ThirdPerson then return end
+    local targetTransp = invis and (Config.Misc.InvisMode == "Local" and 1 or 0.55) or 0
     for _, inst in ipairs(char:GetDescendants()) do
-        if inst:IsA("BasePart") and inst.Name ~= "HumanoidRootPart" and inst.LocalTransparencyModifier ~= 0 then
-            inst.LocalTransparencyModifier = 0
+        if inst:IsA("BasePart") and inst.Name ~= "HumanoidRootPart" then
+            if inst.LocalTransparencyModifier ~= targetTransp then
+                inst.LocalTransparencyModifier = targetTransp
+            end
+        elseif invis and Config.Misc.InvisMode == "Local" and inst:IsA("Decal") then
+            if inst.Transparency ~= 1 then
+                inst.Transparency = 1
+            end
         end
     end
 end)
@@ -3141,6 +3418,7 @@ local function Unload()
     end
 
     RestoreAllMisc()
+    pcall(function() RunService:UnbindFromRenderStep(PRE_INVIS_NAME) end)
     pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
     pcall(function() RunService:UnbindFromRenderStep(POST_BODY_NAME) end)
     for _, conn in ipairs(Connections) do
