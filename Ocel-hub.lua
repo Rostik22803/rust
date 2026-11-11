@@ -889,9 +889,90 @@ local SilentState = {
     Part = nil,
     Char = nil,
     SuppressedClaims = {},
+    LastBowDraw = 1,
+    BowCalibration = nil, -- { baseSpeed, gravity, drag }
 }
 
 local PredictAimPosition
+
+local function GetBowBallistics(draw)
+    local d = math.clamp(type(draw) == "number" and draw or 1, 0.3, 1)
+    local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+    local ammoType = tool and (tool:GetAttribute("AmmoItem") or tool:GetAttribute("AmmoType"))
+    local mult = (type(ammoType) == "string" and AMMO_SPEED_MULT[ammoType]) or 1
+
+    if SilentState.BowCalibration then
+        local cal = SilentState.BowCalibration
+        return math.max(60, cal.baseSpeed * d * mult), cal.gravity, cal.drag
+    end
+
+    local speedAttr = tool and (tool:GetAttribute("ArrowSpeed") or tool:GetAttribute("BulletSpeed") or tool:GetAttribute("Speed"))
+    local baseSpeed = (type(speedAttr) == "number" and speedAttr > 0) and speedAttr or 220
+    local gravAttr = tool and (tool:GetAttribute("BulletGravity") or tool:GetAttribute("Gravity"))
+    local gravity = (type(gravAttr) == "number" and gravAttr >= 0) and gravAttr or 40
+    return math.max(60, baseSpeed * d * mult), gravity, 0
+end
+
+local function PredictBowDirection(origin, part, char, draw)
+    local targetPos = part.Position
+    local speed, gravity, drag = GetBowBallistics(draw)
+    local vel = Config.Aimbot.Prediction and GetSmoothedVelocity(char, part) or Vector3.zero
+
+    local t = math.min((targetPos - origin).Magnitude / speed, 1.8)
+    local aimPos = targetPos
+    for _ = 1, 4 do
+        aimPos = targetPos + vel * t
+        if not Config.Aimbot.GravityComp then
+            t = math.min((aimPos - origin).Magnitude / speed, 1.8)
+        elseif drag > 0.001 then
+            local term = Vector3.new(0, -gravity / drag, 0)
+            local expTerm = math.max(1 - math.exp(-drag * t), 0.001)
+            local reqV0 = (aimPos - origin - term * t) * drag / expTerm + term
+            t = math.min((aimPos - origin).Magnitude / math.max(reqV0.Magnitude, speed * 0.4), 1.8)
+        else
+            local dropPos = aimPos + Vector3.new(0, 0.5 * gravity * t * t, 0)
+            t = math.min((dropPos - origin).Magnitude / speed, 1.8)
+        end
+    end
+
+    if not Config.Aimbot.GravityComp then
+        return (aimPos - origin).Unit
+    elseif drag > 0.001 then
+        local term = Vector3.new(0, -gravity / drag, 0)
+        local expTerm = math.max(1 - math.exp(-drag * t), 0.001)
+        local v0 = (aimPos - origin - term * t) * drag / expTerm + term
+        return v0.Unit
+    else
+        local dropPos = aimPos + Vector3.new(0, 0.5 * gravity * t * t, 0)
+        return (dropPos - origin).Unit
+    end
+end
+
+local function BindBowFlightListener()
+    task.spawn(function()
+        local rs = game:GetService("ReplicatedStorage")
+        local bowRem = rs:FindFirstChild("BowRemotes") or rs:WaitForChild("BowRemotes", 10)
+        if not bowRem then return end
+        local flight = bowRem:FindFirstChild("Flight") or bowRem:WaitForChild("Flight", 10)
+        if not flight or not flight:IsA("RemoteEvent") then return end
+        AddConn(flight.OnClientEvent:Connect(function(p1, p2)
+            local data = (typeof(p1) == "number" and typeof(p2) == "table") and p2 or nil
+            if not data then return end
+            if typeof(data.pos) ~= "Vector3" or typeof(data.vel) ~= "Vector3" then return end
+            if Camera and (data.pos - Camera.CFrame.Position).Magnitude <= 18 then
+                local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                local ammoType = tool and (tool:GetAttribute("AmmoItem") or tool:GetAttribute("AmmoType"))
+                local mult = (type(ammoType) == "string" and AMMO_SPEED_MULT[ammoType]) or 1
+                local draw = math.clamp(SilentState.LastBowDraw or 1, 0.3, 1)
+                SilentState.BowCalibration = {
+                    baseSpeed = data.vel.Magnitude / math.max(draw * mult, 0.1),
+                    gravity = type(data.gravity) == "number" and data.gravity or 40,
+                    drag = type(data.drag) == "number" and data.drag or 0,
+                }
+            end
+        end))
+    end)
+end
 
 local function InstallSilentHook()
     if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
@@ -908,9 +989,26 @@ local function InstallSilentHook()
             local char = SilentState.Char
             if part and part.Parent and char and char.Parent and typeof(self) == "Instance" then
                 local name = self.Name
-                if name == "Fire" then
+                local remFolder = self.Parent
+                local folderName = remFolder and remFolder.Name or ""
+
+                if name == "Fire" or name == "Launch" then
+                    local argc = select("#", ...)
                     local args = { ... }
-                    if typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
+
+                    -- Bow / Crossbow / Blowpipe / Speargun: BowRemotes.Fire(dir, draw, hold, claim) or Launch(dir, claim)
+                    if (folderName == "BowRemotes" or (typeof(args[1]) == "Vector3" and typeof(args[2]) ~= "Vector3")) and typeof(args[1]) == "Vector3" then
+                        if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
+                            local draw = (name == "Fire" and type(args[2]) == "number") and math.clamp(args[2], 0.3, 1) or 1
+                            SilentState.LastBowDraw = draw
+                            local claim = (name == "Fire") and args[4] or args[2]
+                            local origin = (type(claim) == "table" and typeof(claim.o) == "Vector3") and claim.o or Camera.CFrame.Position
+                            args[1] = PredictBowDirection(origin, part, char, draw)
+                            return oldNamecall(self, table.unpack(args, 1, argc))
+                        end
+
+                    -- Firearms / PipePistol / DoubleBarrel: Fire(origin, dir, ...)
+                    elseif typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
                         if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
                             local origin = args[1]
                             local aimPos = PredictAimPosition(part, char)
@@ -918,7 +1016,6 @@ local function InstallSilentHook()
 
                             local claim = args[4]
                             if type(claim) == "table" and type(claim.id) == "number" then
-                                local remFolder = self.Parent
                                 local hitRemote = remFolder and remFolder:FindFirstChild("Hit")
                                 if hitRemote and hitRemote:IsA("RemoteEvent") then
                                     SilentState.SuppressedClaims[claim.id] = os.clock() + 3
@@ -938,9 +1035,10 @@ local function InstallSilentHook()
                                     end)
                                 end
                             end
-                            return oldNamecall(self, table.unpack(args))
+                            return oldNamecall(self, table.unpack(args, 1, argc))
                         end
                     end
+
                 elseif name == "Hit" then
                     local claimId = ...
                     local exp = SilentState.SuppressedClaims[claimId]
@@ -963,7 +1061,7 @@ local function InstallSilentHook()
     local state = { handler = silentHandler, enabled = true }
     sharedRegistry._OcelSilentHook = state
 
-    local ok, oldNc = pcall(function()
+    local ok = pcall(function()
         local old
         old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
             if state.enabled and not checkcaller() then
@@ -971,7 +1069,6 @@ local function InstallSilentHook()
             end
             return old(self, ...)
         end))
-        return old
     end)
     if not ok then
         sharedRegistry._OcelSilentHook = nil
@@ -1875,6 +1972,7 @@ AddConn(UserInputService.InputBegan:Connect(function(input, gp)
 end))
 
 InstallSilentHook()
+BindBowFlightListener()
 
 -- Bind at Last - 1 so CameraModule & SmoothLookPost run first and AimWatchLook runs after
 local STEP_NAME = "OcelHubRenderStep"
