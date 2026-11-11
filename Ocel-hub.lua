@@ -62,6 +62,7 @@ local Config = {
     Aimbot = {
         Enabled = true,
         SilentAim = true,           -- redirects shots inside FOV without snapping camera
+        SilentMethod = "Hook+View", -- "Hook+View" | "ViewSpoof" | "Hook"
         SilentHitChance = 100,      -- % of shots redirected
         SilentSnapline = true,      -- draws subtle line to locked silent target
         TriggerMode = IsMobile and "Button" or "ADS", -- "Button" | "ADS" | "Always"
@@ -974,17 +975,84 @@ local function BindBowFlightListener()
     end)
 end
 
-local function InstallSilentHook()
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-        return
+local function IsBowTool(tool)
+    if not tool then return false end
+    if tool:GetAttribute("Loaded") ~= nil then return true end
+    local ammoItem = tool:GetAttribute("AmmoItem")
+    if ammoItem == "Arrow" or ammoItem == "HVArrow" or ammoItem == "BoneArrow" or ammoItem == "FireArrow" then
+        return true
+    end
+    local n = tool.Name
+    return string.find(n, "Bow", 1, true) ~= nil
+        or string.find(n, "Crossbow", 1, true) ~= nil
+        or string.find(n, "Blowpipe", 1, true) ~= nil
+        or string.find(n, "Speargun", 1, true) ~= nil
+end
+
+local function IsHoldingRangedWeapon()
+    local char = LocalPlayer.Character
+    if not char then return nil, false end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return nil, false end
+    if IsBowTool(tool) then return tool, true end
+    if tool:GetAttribute("BulletSpeed") ~= nil
+        or tool:GetAttribute("GunId") ~= nil
+        or tool:GetAttribute("Ammo") ~= nil
+        or tool:GetAttribute("BaseAmmo") ~= nil then
+        return tool, false
+    end
+    return nil, false
+end
+
+local function InstallViewSpoof()
+    local sharedRegistry = getgenv and getgenv() or _G
+    if sharedRegistry._OcelOrigHeldView == nil then
+        sharedRegistry._OcelOrigHeldView = shared.HeldViewCFrame or false
     end
 
+    shared.HeldViewCFrame = function(camCF)
+        local orig = sharedRegistry._OcelOrigHeldView
+        local baseCF = (type(orig) == "function") and orig(camCF) or camCF
+        if typeof(baseCF) ~= "CFrame" then
+            baseCF = camCF
+        end
+
+        local method = Config.Aimbot.SilentMethod
+        if Config.Aimbot.SilentAim and (method == "ViewSpoof" or method == "Hook+View") and SilentState.Active then
+            local part = SilentState.Part
+            local char = SilentState.Char
+            if part and part.Parent and char and char.Parent and typeof(baseCF) == "CFrame" then
+                local tool, isBow = IsHoldingRangedWeapon()
+                if tool then
+                    if isBow then
+                        local dir = PredictBowDirection(baseCF.Position, part, char, 1)
+                        return CFrame.lookAt(baseCF.Position, baseCF.Position + dir * 100)
+                    else
+                        local aimPos = PredictAimPosition(part, char)
+                        if (aimPos - baseCF.Position).Magnitude > 0.5 then
+                            return CFrame.lookAt(baseCF.Position, aimPos)
+                        end
+                    end
+                end
+            end
+        end
+
+        return baseCF
+    end
+end
+
+local function InstallSilentHook()
     local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
+    local safeCheckCaller = type(checkcaller) == "function" and checkcaller or function() return false end
     local sharedRegistry = getgenv and getgenv() or _G
 
-    local function silentHandler(oldNamecall, self, ...)
-        local method = getnamecallmethod()
-        if method == "FireServer" and Config.Aimbot.SilentAim and SilentState.Active then
+    local function silentHandler(oldFn, self, ...)
+        local sMethod = Config.Aimbot.SilentMethod
+        if sMethod == "ViewSpoof" then
+            return oldFn(self, ...)
+        end
+
+        if Config.Aimbot.SilentAim and SilentState.Active then
             local part = SilentState.Part
             local char = SilentState.Char
             if part and part.Parent and char and char.Parent and typeof(self) == "Instance" then
@@ -1004,7 +1072,7 @@ local function InstallSilentHook()
                             local claim = (name == "Fire") and args[4] or args[2]
                             local origin = (type(claim) == "table" and typeof(claim.o) == "Vector3") and claim.o or Camera.CFrame.Position
                             args[1] = PredictBowDirection(origin, part, char, draw)
-                            return oldNamecall(self, table.unpack(args, 1, argc))
+                            return oldFn(self, table.unpack(args, 1, argc))
                         end
 
                     -- Firearms / PipePistol / DoubleBarrel: Fire(origin, dir, ...)
@@ -1035,7 +1103,7 @@ local function InstallSilentHook()
                                     end)
                                 end
                             end
-                            return oldNamecall(self, table.unpack(args, 1, argc))
+                            return oldFn(self, table.unpack(args, 1, argc))
                         end
                     end
 
@@ -1048,29 +1116,51 @@ local function InstallSilentHook()
                 end
             end
         end
-        return oldNamecall(self, ...)
+        return oldFn(self, ...)
     end
 
-    -- Avoid stacking hookmetamethod across re-executions
     if sharedRegistry._OcelSilentHook then
         sharedRegistry._OcelSilentHook.handler = silentHandler
         sharedRegistry._OcelSilentHook.enabled = true
         return
     end
 
-    local state = { handler = silentHandler, enabled = true }
+    local state = { handler = silentHandler, enabled = true, old = nil }
     sharedRegistry._OcelSilentHook = state
 
-    local ok = pcall(function()
-        local old
-        old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            if state.enabled and not checkcaller() then
-                return state.handler(old, self, ...)
-            end
-            return old(self, ...)
-        end))
-    end)
-    if not ok then
+    local hooked = false
+    if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+        local ok = pcall(function()
+            state.old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+                local method = getnamecallmethod()
+                local old = state.old
+                if state.enabled and (method == "FireServer" or method == "fireServer") and not safeCheckCaller() then
+                    return state.handler(old, self, ...)
+                end
+                return old(self, ...)
+            end))
+        end)
+        hooked = ok and state.old ~= nil
+    end
+
+    -- Fallback: hook RemoteEvent.FireServer directly if hookmetamethod is missing/broken
+    if not hooked and type(hookfunction) == "function" then
+        local ok = pcall(function()
+            local tmp = Instance.new("RemoteEvent")
+            local targetFn = tmp.FireServer
+            tmp:Destroy()
+            state.old = hookfunction(targetFn, wrap(function(self, ...)
+                local old = state.old
+                if state.enabled and not safeCheckCaller() then
+                    return state.handler(old, self, ...)
+                end
+                return old(self, ...)
+            end))
+        end)
+        hooked = ok and state.old ~= nil
+    end
+
+    if not hooked then
         sharedRegistry._OcelSilentHook = nil
     end
 end
@@ -1854,6 +1944,7 @@ AddSlider(ESPTabPage, "Max Distance (studs)", 200, 2500, 50, function() return C
 
 -- Populate Aimbot tab
 AddToggle(AimTabPage, "Silent Aim", function() return Config.Aimbot.SilentAim end, function(v) Config.Aimbot.SilentAim = v end)
+AddCycle(AimTabPage, "Silent Method", { "Hook+View", "ViewSpoof", "Hook" }, function() return Config.Aimbot.SilentMethod end, function(v) Config.Aimbot.SilentMethod = v end)
 AddToggle(AimTabPage, "Silent Snapline", function() return Config.Aimbot.SilentSnapline end, function(v) Config.Aimbot.SilentSnapline = v end)
 AddSlider(AimTabPage, "Silent Hit Chance (%)", 10, 100, 5, function() return Config.Aimbot.SilentHitChance end, function(v) Config.Aimbot.SilentHitChance = v end)
 AddToggle(AimTabPage, "Aimbot Enabled", function() return Config.Aimbot.Enabled end, function(v)
@@ -1971,6 +2062,7 @@ AddConn(UserInputService.InputBegan:Connect(function(input, gp)
     end
 end))
 
+InstallViewSpoof()
 InstallSilentHook()
 BindBowFlightListener()
 
@@ -2010,6 +2102,11 @@ local function Unload()
     local sharedRegistry = getgenv and getgenv() or _G
     if sharedRegistry._OcelSilentHook then
         sharedRegistry._OcelSilentHook.enabled = false
+    end
+    if sharedRegistry._OcelOrigHeldView ~= nil then
+        local orig = sharedRegistry._OcelOrigHeldView
+        shared.HeldViewCFrame = (type(orig) == "function") and orig or nil
+        sharedRegistry._OcelOrigHeldView = nil
     end
 
     pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
