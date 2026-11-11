@@ -6,6 +6,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
@@ -68,8 +69,11 @@ local Config = {
         TriggerMode = IsMobile and "Button" or "ADS", -- "Button" | "ADS" | "Always"
         ButtonMode = "Hold",        -- "Hold" | "Toggle" (for floating AIM button)
         FOV = 135,                  -- pixels radius
+        FullScreenFOV = false,      -- covers entire screen regardless of resolution
         ShowFOV = true,
         FOVColor = Color3.fromRGB(255, 255, 255),
+        TriggerBot = false,
+        TriggerDelayMs = 20,        -- reaction delay before firing (ms)
         Smoothness = 4.5,           -- 1 = instant snap, 4-8 = smooth legit
         MaxDegPerSec = 580,         -- angular speed cap (AimWatchLook safe)
         TargetPart = "Head",        -- "Head" | "UpperTorso" | "Closest" | "LowerTorso"
@@ -85,6 +89,21 @@ local Config = {
         FallbackBulletSpeed = 1000,
         FallbackGravity = 60,
         MaxDistance = 1000,
+    },
+    Misc = {
+        NoRecoil = false,
+        NoSpread = false,
+        ThirdPerson = false,
+        ThirdPersonDist = 11,       -- studs
+        Fullbright = false,
+        AntiAim = false,
+        AntiAimMode = "Spin",       -- "Spin" | "Jitter" | "Backwards" | "Random"
+        AntiAimSpeed = 22,          -- rad/s for Spin
+        AntiAimPitch = "Down",      -- "Down" | "Up" | "Jitter" | "Off"
+        PotatoGraphics = false,     -- FPS booster (smooth plastic, no grass/shadows/particles)
+        LongJump = false,
+        LongJumpBoost = 44,         -- horizontal velocity (studs/s)
+        LongJumpHeight = 58,        -- vertical velocity (studs/s)
     },
     UI = {
         Open = not IsMobile,        -- on mobile start collapsed to clean OCEL pill
@@ -1060,6 +1079,22 @@ local function InstallSilentHook()
     local sharedRegistry = getgenv and getgenv() or _G
 
     local function silentHandler(sendFn, self, ...)
+        if Config.Misc.AntiAim and Config.Misc.AntiAimPitch ~= "Off" and typeof(self) == "Instance" and self.Name == "Pose" then
+            local argc = select("#", ...)
+            local args = { ... }
+            if type(args[2]) == "number" then
+                local pMode = Config.Misc.AntiAimPitch
+                if pMode == "Down" then
+                    args[2] = -1.42
+                elseif pMode == "Up" then
+                    args[2] = 1.42
+                else -- "Jitter"
+                    args[2] = (math.floor(os.clock() * 18) % 2 == 0) and -1.42 or 1.42
+                end
+                return sendFn(self, table.unpack(args, 1, argc))
+            end
+        end
+
         local sMethod = Config.Aimbot.SilentMethod
         if sMethod == "ViewSpoof" or not Config.Aimbot.SilentAim or not SilentState.Active then
             return sendFn(self, ...)
@@ -1333,9 +1368,17 @@ PredictAimPosition = function(part, char)
     return finalPos
 end
 
+local function GetEffectiveFOV()
+    if Config.Aimbot.FullScreenFOV and Camera then
+        return math.ceil(Camera.ViewportSize.Magnitude * 0.58)
+    end
+    return Config.Aimbot.FOV
+end
+
 local function PickAimTarget(screenCenter)
+    local fov = GetEffectiveFOV()
     if Config.Aimbot.StickyTarget and LockedTarget and LockedTarget.Parent then
-        local part, char = IsValidTargetEntry(LockedTarget, screenCenter, Config.Aimbot.FOV * 1.5)
+        local part, char = IsValidTargetEntry(LockedTarget, screenCenter, fov * 1.5)
         if part then
             return LockedTarget, part, char
         end
@@ -1347,7 +1390,7 @@ local function PickAimTarget(screenCenter)
 
     if Config.Aimbot.TargetPlayers then
         for _, player in ipairs(Players:GetPlayers()) do
-            local part, char, screenDist = IsValidTargetEntry(player, screenCenter, Config.Aimbot.FOV)
+            local part, char, screenDist = IsValidTargetEntry(player, screenCenter, fov)
             if part and screenDist < bestScore then
                 bestScore = screenDist
                 bestTarget = player
@@ -1359,7 +1402,7 @@ local function PickAimTarget(screenCenter)
 
     if Config.Aimbot.TargetBots or Config.Aimbot.TargetSleepers then
         for model, _ in pairs(EntityPool) do
-            local part, char, screenDist = IsValidTargetEntry(model, screenCenter, Config.Aimbot.FOV)
+            local part, char, screenDist = IsValidTargetEntry(model, screenCenter, fov)
             if part and screenDist < bestScore then
                 bestScore = screenDist
                 bestTarget = model
@@ -1378,7 +1421,7 @@ local function StepAimbot(dt)
     local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
     local anyAimOn = Config.Aimbot.Enabled or Config.Aimbot.SilentAim
 
-    if anyAimOn and Config.Aimbot.ShowFOV then
+    if anyAimOn and Config.Aimbot.ShowFOV and not Config.Aimbot.FullScreenFOV then
         FOVCircleOutline.Position = screenCenter
         FOVCircleOutline.Radius = Config.Aimbot.FOV
         FOVCircleOutline.Visible = true
@@ -1474,6 +1517,632 @@ local function StepAimbot(dt)
         GameShared.SmoothLookAim.yaw = math.atan2(-lv.X, -lv.Z)
         GameShared.SmoothLookAim.pitch = math.asin(math.clamp(lv.Y, -1, 1))
         GameShared.SmoothLookAim.at = os.clock()
+    end
+end
+
+-- ============================================================================
+-- MISC FEATURES (NO RECOIL, NO SPREAD, 3RD PERSON, FULLBRIGHT, ANTI-AIM)
+-- ============================================================================
+local ATTR_NIL = {}
+local ToolAttrBackup = setmetatable({}, { __mode = "k" })
+local LiveTableBackup = setmetatable({}, { __mode = "k" })
+
+local RECOIL_ATTRS = {
+    C_Kick = 0,
+    C_KickSide = 0,
+    C_AdsKick = 0,
+    C_KickBack = 0,
+    C_KickTilt = 0,
+    C_AdsViewKick = 0,
+    C_RecoilPitch = Vector2.zero,
+    C_RecoilYaw = Vector2.zero,
+    C_AdsRecoil = 0,
+    C_MoveRecoil = 0,
+    C_AimSway = 0,
+    C_Pattern = "",
+    CameraKick = 0,
+}
+
+local SPREAD_ATTRS = {
+    C_HipSpread = 0,
+    C_AdsSpread = 0,
+    C_BloomPerShot = 0,
+    C_BloomMax = 0,
+    C_PelletSpread = 0,
+    C_AimSway = 0,
+    HipCone = 0,
+    AdsCone = 0,
+}
+
+local function ApplyAttrGroup(tool, group, enable)
+    local bkp = ToolAttrBackup[tool]
+    if not bkp then
+        bkp = {}
+        ToolAttrBackup[tool] = bkp
+    end
+    for attr, zeroVal in pairs(group) do
+        local cur = tool:GetAttribute(attr)
+        if enable then
+            if bkp[attr] == nil then
+                bkp[attr] = (cur == nil) and ATTR_NIL or cur
+            end
+            if cur ~= nil or string.sub(attr, 1, 2) == "C_" then
+                pcall(tool.SetAttribute, tool, attr, zeroVal)
+            end
+        elseif bkp[attr] ~= nil then
+            local orig = bkp[attr]
+            pcall(tool.SetAttribute, tool, attr, (orig == ATTR_NIL) and nil or orig)
+        end
+    end
+end
+
+local function PatchWeaponTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+    ApplyAttrGroup(tool, RECOIL_ATTRS, Config.Misc.NoRecoil)
+    ApplyAttrGroup(tool, SPREAD_ATTRS, Config.Misc.NoSpread)
+end
+
+local function PatchLiveWeaponTables()
+    if type(getgc) ~= "function" then return end
+    pcall(function()
+        for _, obj in ipairs(getgc(true)) do
+            if type(obj) == "table" and rawget(obj, "hipSpread") ~= nil and rawget(obj, "adsSpread") ~= nil and rawget(obj, "kick") ~= nil then
+                local bkp = LiveTableBackup[obj]
+                if not bkp then
+                    bkp = {
+                        kick = obj.kick,
+                        kickSide = obj.kickSide,
+                        adsKick = obj.adsKick,
+                        kickBack = obj.kickBack,
+                        kickTilt = obj.kickTilt,
+                        adsViewKick = obj.adsViewKick,
+                        recoilPitch = obj.recoilPitch,
+                        recoilYaw = obj.recoilYaw,
+                        adsRecoil = obj.adsRecoil,
+                        moveRecoil = obj.moveRecoil,
+                        recoilMult = obj.recoilMult,
+                        pattern = obj.pattern,
+                        hipSpread = obj.hipSpread,
+                        adsSpread = obj.adsSpread,
+                        bloomPerShot = obj.bloomPerShot,
+                        bloomMax = obj.bloomMax,
+                        pelletSpread = obj.pelletSpread,
+                        aimSway = obj.aimSway,
+                    }
+                    LiveTableBackup[obj] = bkp
+                end
+
+                if Config.Misc.NoRecoil then
+                    obj.kick = 0
+                    obj.kickSide = 0
+                    obj.adsKick = 0
+                    obj.kickBack = 0
+                    obj.kickTilt = 0
+                    obj.adsViewKick = 0
+                    obj.recoilPitch = Vector2.zero
+                    obj.recoilYaw = Vector2.zero
+                    obj.adsRecoil = 0
+                    obj.moveRecoil = 0
+                    obj.recoilMult = 0
+                    obj.pattern = nil
+                    obj.aimSway = 0
+                else
+                    obj.kick = bkp.kick
+                    obj.kickSide = bkp.kickSide
+                    obj.adsKick = bkp.adsKick
+                    obj.kickBack = bkp.kickBack
+                    obj.kickTilt = bkp.kickTilt
+                    obj.adsViewKick = bkp.adsViewKick
+                    obj.recoilPitch = bkp.recoilPitch
+                    obj.recoilYaw = bkp.recoilYaw
+                    obj.adsRecoil = bkp.adsRecoil
+                    obj.moveRecoil = bkp.moveRecoil
+                    obj.recoilMult = bkp.recoilMult
+                    obj.pattern = bkp.pattern
+                end
+
+                if Config.Misc.NoSpread then
+                    obj.hipSpread = 0
+                    obj.adsSpread = 0
+                    obj.bloomPerShot = 0
+                    obj.bloomMax = 0
+                    obj.pelletSpread = 0
+                    obj.aimSway = 0
+                else
+                    obj.hipSpread = bkp.hipSpread
+                    obj.adsSpread = bkp.adsSpread
+                    obj.bloomPerShot = bkp.bloomPerShot
+                    obj.bloomMax = bkp.bloomMax
+                    obj.pelletSpread = bkp.pelletSpread
+                    if not Config.Misc.NoRecoil then
+                        obj.aimSway = bkp.aimSway
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function ApplyAllWeapons()
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if backpack then
+        for _, child in ipairs(backpack:GetChildren()) do
+            PatchWeaponTool(child)
+        end
+    end
+    if LocalPlayer.Character then
+        for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
+            PatchWeaponTool(child)
+        end
+    end
+    PatchLiveWeaponTables()
+end
+
+local function WatchWeaponContainer(container)
+    if not container then return end
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Tool") then PatchWeaponTool(child) end
+    end
+    AddConn(container.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            PatchWeaponTool(child)
+            if Config.Misc.NoRecoil or Config.Misc.NoSpread then
+                task.defer(PatchLiveWeaponTables)
+            end
+        end
+    end))
+end
+
+-- Fullbright state
+local SavedLighting = nil
+local SavedAtmosphere = nil
+
+local function StepFullbright()
+    if Config.Misc.Fullbright then
+        if not SavedLighting then
+            SavedLighting = {
+                Ambient = Lighting.Ambient,
+                OutdoorAmbient = Lighting.OutdoorAmbient,
+                Brightness = Lighting.Brightness,
+                ClockTime = Lighting.ClockTime,
+                GlobalShadows = Lighting.GlobalShadows,
+                FogEnd = Lighting.FogEnd,
+                ExposureCompensation = Lighting.ExposureCompensation,
+            }
+        end
+        Lighting.Ambient = Color3.fromRGB(205, 205, 205)
+        Lighting.OutdoorAmbient = Color3.fromRGB(205, 205, 205)
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        Lighting.ExposureCompensation = 0.2
+
+        local atmo = Lighting:FindFirstChildOfClass("Atmosphere")
+        if atmo then
+            if not SavedAtmosphere or SavedAtmosphere.inst ~= atmo then
+                SavedAtmosphere = { inst = atmo, Density = atmo.Density, Haze = atmo.Haze }
+            end
+            atmo.Density = 0
+            atmo.Haze = 0
+        end
+    elseif SavedLighting then
+        for k, v in pairs(SavedLighting) do
+            pcall(function() Lighting[k] = v end)
+        end
+        SavedLighting = nil
+        if SavedAtmosphere and SavedAtmosphere.inst and SavedAtmosphere.inst.Parent then
+            pcall(function()
+                SavedAtmosphere.inst.Density = SavedAtmosphere.Density
+                SavedAtmosphere.inst.Haze = SavedAtmosphere.Haze
+            end)
+        end
+        SavedAtmosphere = nil
+    end
+end
+
+-- 3rd Person state
+local SavedCameraState = nil
+
+local function StepThirdPerson()
+    if Config.Misc.ThirdPerson then
+        if not SavedCameraState then
+            SavedCameraState = {
+                CameraMode = LocalPlayer.CameraMode,
+                CameraMinZoomDistance = LocalPlayer.CameraMinZoomDistance,
+                CameraMaxZoomDistance = LocalPlayer.CameraMaxZoomDistance,
+            }
+        end
+        local dist = Config.Misc.ThirdPersonDist
+        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+        LocalPlayer.CameraMinZoomDistance = dist
+        LocalPlayer.CameraMaxZoomDistance = dist
+    elseif SavedCameraState then
+        LocalPlayer.CameraMode = SavedCameraState.CameraMode
+        LocalPlayer.CameraMinZoomDistance = SavedCameraState.CameraMinZoomDistance
+        LocalPlayer.CameraMaxZoomDistance = SavedCameraState.CameraMaxZoomDistance
+        SavedCameraState = nil
+    end
+end
+
+-- Anti-Aim state
+local AntiAimYaw = 0
+local AntiAimAutoRotWasDisabled = false
+
+local function StepAntiAim(dt)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+
+    if not Config.Misc.AntiAim then
+        if AntiAimAutoRotWasDisabled and hum then
+            hum.AutoRotate = true
+            AntiAimAutoRotWasDisabled = false
+        end
+        return
+    end
+
+    if not hum or not hrp or hum.Health <= 0 then return end
+    if hum.AutoRotate then
+        hum.AutoRotate = false
+        AntiAimAutoRotWasDisabled = true
+    end
+
+    local mode = Config.Misc.AntiAimMode
+    if mode == "Spin" then
+        AntiAimYaw = (AntiAimYaw + Config.Misc.AntiAimSpeed * dt) % (math.pi * 2)
+    elseif mode == "Jitter" then
+        local lv = Camera.CFrame.LookVector
+        local camYaw = math.atan2(-lv.X, -lv.Z)
+        local flip = (math.floor(os.clock() * 20) % 2 == 0) and 1.2 or -1.2
+        AntiAimYaw = camYaw + math.pi + flip
+    elseif mode == "Backwards" then
+        local lv = Camera.CFrame.LookVector
+        AntiAimYaw = math.atan2(-lv.X, -lv.Z) + math.pi
+    else -- "Random"
+        AntiAimYaw = math.random() * math.pi * 2
+    end
+
+    local pos = hrp.Position
+    hrp.CFrame = CFrame.new(pos) * CFrame.Angles(0, AntiAimYaw, 0)
+end
+
+-- TriggerBot (Mobile + PC via TouchInput & mouse1 fallback)
+local TriggerBotPulse = false
+local TriggerHoverSince = nil
+local TriggerNextFireAt = 0
+local TouchInputMod = nil
+local OrigIsMouseBtnPressed = nil
+
+local function InstallTriggerBotHook()
+    if TouchInputMod then return end
+    pcall(function()
+        local rs = game:GetService("ReplicatedStorage")
+        local modScript = rs:FindFirstChild("TouchInput")
+        if modScript and modScript:IsA("ModuleScript") then
+            local mod = require(modScript)
+            if type(mod) == "table" and type(mod.isMouseButtonPressed) == "function" then
+                TouchInputMod = mod
+                OrigIsMouseBtnPressed = mod.isMouseButtonPressed
+                mod.isMouseButtonPressed = function(btn)
+                    if TriggerBotPulse and btn == Enum.UserInputType.MouseButton1 then
+                        return true
+                    end
+                    return OrigIsMouseBtnPressed(btn)
+                end
+            end
+        end
+    end)
+end
+
+local function IsValidTriggerModel(model)
+    if not model or model == LocalPlayer.Character then return false end
+    local player = Players:GetPlayerFromCharacter(model)
+    if player then
+        if not Config.Aimbot.TargetPlayers then return false end
+        if Config.Aimbot.TeamCheck and IsTeammate(player) then return false end
+        local hp, _, hasHp = GetModelHealth(model, false)
+        if not hasHp or hp <= 0 or model:GetAttribute("Dead") == true then return false end
+        if Config.Aimbot.IgnoreDowned and IsDowned(model) then return false end
+        return true
+    end
+    local info = EntityPool[model]
+    if info then
+        if info.kind == "Bot" then
+            if not Config.Aimbot.TargetBots then return false end
+            local hp, _, hasHp = GetModelHealth(model, false)
+            return hasHp and hp > 0 and model:GetAttribute("Dead") ~= true
+        elseif info.kind == "Sleeper" then
+            if not Config.Aimbot.TargetSleepers then return false end
+            local uid = model:GetAttribute("SleeperUserId")
+            if uid == LocalPlayer.UserId then return false end
+            if Config.Aimbot.TeamCheck and IsTeammateUserId(uid) then return false end
+            local hp, _, hasHp = GetModelHealth(model, true)
+            return (not hasHp or hp > 0) and model:GetAttribute("Dead") ~= true
+        end
+    end
+    return false
+end
+
+local function StepTriggerBot()
+    if not Config.Aimbot.TriggerBot or not Camera then
+        TriggerBotPulse = false
+        TriggerHoverSince = nil
+        return
+    end
+    local tool, isBow = IsHoldingRangedWeapon()
+    if not tool or isBow then
+        TriggerBotPulse = false
+        TriggerHoverSince = nil
+        return
+    end
+
+    local now = os.clock()
+    if now < TriggerNextFireAt then
+        return
+    end
+
+    local origin = Camera.CFrame.Position
+    local dir = Camera.CFrame.LookVector * Config.Aimbot.MaxDistance
+    local ignore = { Camera }
+    if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+    for _, folderName in ipairs({ "DroppedItems", "StuckArrows", "FirearmsTracers", "BowEffects" }) do
+        local f = Workspace:FindFirstChild(folderName)
+        if f then table.insert(ignore, f) end
+    end
+    RayParams.FilterDescendantsInstances = ignore
+
+    local hitModel = nil
+    for _ = 1, 5 do
+        local res = Workspace:Raycast(origin, dir, RayParams)
+        if not res then break end
+        local inst = res.Instance
+        if not inst.CanQuery or (not inst.CanCollide and inst.Transparency >= 0.45) then
+            table.insert(ignore, inst)
+            RayParams.FilterDescendantsInstances = ignore
+        else
+            hitModel = inst:FindFirstAncestorOfClass("Model")
+            while hitModel and not hitModel:FindFirstChildOfClass("Humanoid") and not EntityPool[hitModel] do
+                hitModel = hitModel:FindFirstAncestorOfClass("Model")
+            end
+            break
+        end
+    end
+
+    if hitModel and IsValidTriggerModel(hitModel) then
+        if not TriggerHoverSince then
+            TriggerHoverSince = now
+        end
+        if (now - TriggerHoverSince) * 1000 >= Config.Aimbot.TriggerDelayMs then
+            TriggerNextFireAt = now + 0.11
+            if TouchInputMod then
+                TriggerBotPulse = true
+                task.delay(0.045, function()
+                    TriggerBotPulse = false
+                end)
+            elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
+                pcall(mouse1press)
+                task.delay(0.045, function()
+                    pcall(mouse1release)
+                end)
+            end
+        end
+    else
+        TriggerHoverSince = nil
+        TriggerBotPulse = false
+    end
+end
+
+-- FPS Booster / Potato Graphics
+local PotatoBackup = {
+    Parts = setmetatable({}, { __mode = "k" }),
+    Effects = setmetatable({}, { __mode = "k" }),
+    Lighting = nil,
+    Terrain = nil,
+    Conn = nil,
+    Quality = nil,
+}
+
+local function IsCharacterDescendant(inst)
+    local m = inst:FindFirstAncestorOfClass("Model")
+    while m do
+        if m == LocalPlayer.Character or Players:GetPlayerFromCharacter(m) or EntityPool[m] then
+            return true
+        end
+        m = m:FindFirstAncestorOfClass("Model")
+    end
+    return false
+end
+
+local function ApplyPotatoToInstance(inst)
+    if inst:IsA("BasePart") then
+        if IsCharacterDescendant(inst) then return end
+        if not PotatoBackup.Parts[inst] then
+            PotatoBackup.Parts[inst] = {
+                Material = inst.Material,
+                Reflectance = inst.Reflectance,
+                CastShadow = inst.CastShadow,
+            }
+        end
+        inst.Material = Enum.Material.SmoothPlastic
+        inst.Reflectance = 0
+        inst.CastShadow = false
+    elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Smoke") or inst:IsA("Fire") or inst:IsA("Sparkles") then
+        if not PotatoBackup.Effects[inst] then
+            PotatoBackup.Effects[inst] = inst.Enabled
+        end
+        inst.Enabled = false
+    elseif inst:IsA("PostEffect") then
+        if not PotatoBackup.Effects[inst] then
+            PotatoBackup.Effects[inst] = inst.Enabled
+        end
+        inst.Enabled = false
+    end
+end
+
+local function ApplyPotatoGraphics(enable)
+    if enable then
+        if not PotatoBackup.Lighting then
+            PotatoBackup.Lighting = { GlobalShadows = Lighting.GlobalShadows }
+        end
+        Lighting.GlobalShadows = false
+
+        pcall(function()
+            local r = settings().Rendering
+            if not PotatoBackup.Quality then
+                PotatoBackup.Quality = r.QualityLevel
+            end
+            r.QualityLevel = Enum.QualityLevel.Level01
+        end)
+
+        local terrain = Workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            if not PotatoBackup.Terrain then
+                local deco = true
+                if type(gethiddenproperty) == "function" then
+                    local ok, val = pcall(gethiddenproperty, terrain, "Decoration")
+                    if ok then deco = val end
+                end
+                PotatoBackup.Terrain = {
+                    WaterWaveSize = terrain.WaterWaveSize,
+                    WaterWaveSpeed = terrain.WaterWaveSpeed,
+                    WaterReflectance = terrain.WaterReflectance,
+                    WaterTransparency = terrain.WaterTransparency,
+                    Decoration = deco,
+                }
+            end
+            terrain.WaterWaveSize = 0
+            terrain.WaterWaveSpeed = 0
+            terrain.WaterReflectance = 0
+            terrain.WaterTransparency = 0
+            if type(sethiddenproperty) == "function" then
+                pcall(sethiddenproperty, terrain, "Decoration", false)
+            end
+        end
+
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            ApplyPotatoToInstance(inst)
+        end
+        for _, inst in ipairs(Lighting:GetDescendants()) do
+            ApplyPotatoToInstance(inst)
+        end
+
+        if not PotatoBackup.Conn then
+            PotatoBackup.Conn = Workspace.DescendantAdded:Connect(function(inst)
+                if Config.Misc.PotatoGraphics then
+                    ApplyPotatoToInstance(inst)
+                end
+            end)
+        end
+    else
+        if PotatoBackup.Conn then
+            pcall(function() PotatoBackup.Conn:Disconnect() end)
+            PotatoBackup.Conn = nil
+        end
+        for inst, orig in pairs(PotatoBackup.Parts) do
+            if inst and inst.Parent then
+                pcall(function()
+                    inst.Material = orig.Material
+                    inst.Reflectance = orig.Reflectance
+                    inst.CastShadow = orig.CastShadow
+                end)
+            end
+        end
+        table.clear(PotatoBackup.Parts)
+
+        for inst, origEnabled in pairs(PotatoBackup.Effects) do
+            if inst and inst.Parent then
+                pcall(function() inst.Enabled = origEnabled end)
+            end
+        end
+        table.clear(PotatoBackup.Effects)
+
+        if PotatoBackup.Lighting then
+            pcall(function() Lighting.GlobalShadows = PotatoBackup.Lighting.GlobalShadows end)
+            PotatoBackup.Lighting = nil
+        end
+        if PotatoBackup.Quality then
+            pcall(function() settings().Rendering.QualityLevel = PotatoBackup.Quality end)
+            PotatoBackup.Quality = nil
+        end
+        local terrain = Workspace:FindFirstChildOfClass("Terrain")
+        if terrain and PotatoBackup.Terrain then
+            local t = PotatoBackup.Terrain
+            pcall(function()
+                terrain.WaterWaveSize = t.WaterWaveSize
+                terrain.WaterWaveSpeed = t.WaterWaveSpeed
+                terrain.WaterReflectance = t.WaterReflectance
+                terrain.WaterTransparency = t.WaterTransparency
+            end)
+            if type(sethiddenproperty) == "function" then
+                pcall(sethiddenproperty, terrain, "Decoration", t.Decoration)
+            end
+            PotatoBackup.Terrain = nil
+        end
+    end
+end
+
+-- Long Jump (binds Humanoid.StateChanged so it works cleanly with JumpLimiter)
+local LongJumpConn = nil
+local function BindLongJump(char)
+    if LongJumpConn then
+        pcall(function() LongJumpConn:Disconnect() end)
+        LongJumpConn = nil
+    end
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
+    if not hum or not hrp then return end
+
+    LongJumpConn = hum.StateChanged:Connect(function(_, newState)
+        if not Config.Misc.LongJump or newState ~= Enum.HumanoidStateType.Jumping then
+            return
+        end
+        task.defer(function()
+            if not hrp.Parent or not hum.Parent then return end
+            local move = hum.MoveDirection
+            local horiz
+            if move.Magnitude > 0.1 then
+                horiz = Vector3.new(move.X, 0, move.Z).Unit
+            elseif Camera then
+                local lv = Camera.CFrame.LookVector
+                horiz = Vector3.new(lv.X, 0, lv.Z)
+                horiz = horiz.Magnitude > 0.01 and horiz.Unit or Vector3.zero
+            else
+                horiz = Vector3.zero
+            end
+            local cur = hrp.AssemblyLinearVelocity
+            hrp.AssemblyLinearVelocity = Vector3.new(
+                horiz.X * Config.Misc.LongJumpBoost,
+                math.max(cur.Y, Config.Misc.LongJumpHeight),
+                horiz.Z * Config.Misc.LongJumpBoost
+            )
+        end)
+    end)
+end
+
+local function RestoreAllMisc()
+    Config.Aimbot.TriggerBot = false
+    TriggerBotPulse = false
+    if TouchInputMod and OrigIsMouseBtnPressed then
+        TouchInputMod.isMouseButtonPressed = OrigIsMouseBtnPressed
+    end
+    Config.Misc.NoRecoil = false
+    Config.Misc.NoSpread = false
+    ApplyAllWeapons()
+    Config.Misc.PotatoGraphics = false
+    ApplyPotatoGraphics(false)
+    Config.Misc.Fullbright = false
+    StepFullbright()
+    Config.Misc.ThirdPerson = false
+    StepThirdPerson()
+    Config.Misc.AntiAim = false
+    StepAntiAim(0)
+    Config.Misc.LongJump = false
+    if LongJumpConn then
+        pcall(function() LongJumpConn:Disconnect() end)
+        LongJumpConn = nil
     end
 end
 
@@ -1745,7 +2414,19 @@ AimTabPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
 AimTabPage.Visible = false
 AimTabPage.Parent = Panel
 
-for _, page in ipairs({ ESPTabPage, AimTabPage }) do
+local MiscTabPage = Instance.new("ScrollingFrame")
+MiscTabPage.Size = ESPTabPage.Size
+MiscTabPage.Position = ESPTabPage.Position
+MiscTabPage.BackgroundTransparency = 1
+MiscTabPage.BorderSizePixel = 0
+MiscTabPage.ScrollBarThickness = 2
+MiscTabPage.ScrollBarImageColor3 = Theme.AccentMuted
+MiscTabPage.CanvasSize = UDim2.fromOffset(0, 0)
+MiscTabPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
+MiscTabPage.Visible = false
+MiscTabPage.Parent = Panel
+
+for _, page in ipairs({ ESPTabPage, AimTabPage, MiscTabPage }) do
     local list = Instance.new("UIListLayout", page)
     list.Padding = UDim.new(0, 6)
     list.SortOrder = Enum.SortOrder.LayoutOrder
@@ -1753,7 +2434,7 @@ end
 
 local function MakeTabButton(text, xScale, onClick)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0.49, 0, 1, -4)
+    btn.Size = UDim2.new(0.326, 0, 1, -4)
     btn.Position = UDim2.new(xScale, 2, 0, 2)
     btn.BorderSizePixel = 0
     btn.Font = Enum.Font.GothamBold
@@ -1766,19 +2447,25 @@ local function MakeTabButton(text, xScale, onClick)
     return btn
 end
 
-local TabBtnESP, TabBtnAim
+local TabBtnESP, TabBtnAim, TabBtnMisc
 local function SelectTab(which)
     local isESP = (which == "ESP")
+    local isAIM = (which == "AIM")
+    local isMISC = (which == "MISC")
     ESPTabPage.Visible = isESP
-    AimTabPage.Visible = not isESP
+    AimTabPage.Visible = isAIM
+    MiscTabPage.Visible = isMISC
     TabBtnESP.BackgroundColor3 = isESP and Theme.Accent or Theme.Surface
     TabBtnESP.TextColor3 = isESP and Theme.Bg or Theme.TextDim
-    TabBtnAim.BackgroundColor3 = (not isESP) and Theme.Accent or Theme.Surface
-    TabBtnAim.TextColor3 = (not isESP) and Theme.Bg or Theme.TextDim
+    TabBtnAim.BackgroundColor3 = isAIM and Theme.Accent or Theme.Surface
+    TabBtnAim.TextColor3 = isAIM and Theme.Bg or Theme.TextDim
+    TabBtnMisc.BackgroundColor3 = isMISC and Theme.Accent or Theme.Surface
+    TabBtnMisc.TextColor3 = isMISC and Theme.Bg or Theme.TextDim
 end
 
 TabBtnESP = MakeTabButton("ESP", 0, function() SelectTab("ESP") end)
-TabBtnAim = MakeTabButton("AIMBOT", 0.5, function() SelectTab("AIM") end)
+TabBtnAim = MakeTabButton("AIMBOT", 0.333, function() SelectTab("AIM") end)
+TabBtnMisc = MakeTabButton("MISC", 0.666, function() SelectTab("MISC") end)
 SelectTab("ESP")
 
 local function SyncAimFloatVisibility()
@@ -2004,7 +2691,10 @@ AddToggle(AimTabPage, "Target Players", function() return Config.Aimbot.TargetPl
 AddToggle(AimTabPage, "Target Bots", function() return Config.Aimbot.TargetBots end, function(v) Config.Aimbot.TargetBots = v end)
 AddToggle(AimTabPage, "Target Sleepers", function() return Config.Aimbot.TargetSleepers end, function(v) Config.Aimbot.TargetSleepers = v end)
 AddToggle(AimTabPage, "Show FOV Circle", function() return Config.Aimbot.ShowFOV end, function(v) Config.Aimbot.ShowFOV = v end)
-AddSlider(AimTabPage, "FOV Radius (px)", 30, 450, 5, function() return Config.Aimbot.FOV end, function(v) Config.Aimbot.FOV = v end)
+AddToggle(AimTabPage, "Full Screen FOV", function() return Config.Aimbot.FullScreenFOV end, function(v) Config.Aimbot.FullScreenFOV = v end)
+AddSlider(AimTabPage, "FOV Radius (px)", 30, 1200, 10, function() return Config.Aimbot.FOV end, function(v) Config.Aimbot.FOV = v end)
+AddToggle(AimTabPage, "Trigger Bot", function() return Config.Aimbot.TriggerBot end, function(v) Config.Aimbot.TriggerBot = v end)
+AddSlider(AimTabPage, "Trigger Delay (ms)", 0, 250, 5, function() return Config.Aimbot.TriggerDelayMs end, function(v) Config.Aimbot.TriggerDelayMs = v end)
 AddSlider(AimTabPage, "Smoothness (1=snap)", 1, 16, 0.5, function() return Config.Aimbot.Smoothness end, function(v) Config.Aimbot.Smoothness = v end)
 AddSlider(AimTabPage, "Max Turn (deg/s)", 200, 1500, 25, function() return Config.Aimbot.MaxDegPerSec end, function(v) Config.Aimbot.MaxDegPerSec = v end)
 AddToggle(AimTabPage, "Visibility Check", function() return Config.Aimbot.VisibilityCheck end, function(v) Config.Aimbot.VisibilityCheck = v end)
@@ -2013,6 +2703,46 @@ AddToggle(AimTabPage, "Ignore Downed", function() return Config.Aimbot.IgnoreDow
 AddToggle(AimTabPage, "Ballistic Prediction", function() return Config.Aimbot.Prediction end, function(v) Config.Aimbot.Prediction = v end)
 AddToggle(AimTabPage, "Bullet Drop Comp", function() return Config.Aimbot.GravityComp end, function(v) Config.Aimbot.GravityComp = v end)
 AddToggle(AimTabPage, "Sticky Target", function() return Config.Aimbot.StickyTarget end, function(v) Config.Aimbot.StickyTarget = v end)
+
+-- Populate Misc tab
+AddToggle(MiscTabPage, "No Recoil", function() return Config.Misc.NoRecoil end, function(v)
+    Config.Misc.NoRecoil = v
+    ApplyAllWeapons()
+end)
+AddToggle(MiscTabPage, "No Spread", function() return Config.Misc.NoSpread end, function(v)
+    Config.Misc.NoSpread = v
+    ApplyAllWeapons()
+end)
+AddToggle(MiscTabPage, "3rd Person", function() return Config.Misc.ThirdPerson end, function(v)
+    Config.Misc.ThirdPerson = v
+    StepThirdPerson()
+end)
+AddSlider(MiscTabPage, "3rd Person Dist", 4, 24, 1, function() return Config.Misc.ThirdPersonDist end, function(v)
+    Config.Misc.ThirdPersonDist = v
+    if Config.Misc.ThirdPerson then
+        StepThirdPerson()
+    end
+end)
+AddToggle(MiscTabPage, "Fullbright", function() return Config.Misc.Fullbright end, function(v)
+    Config.Misc.Fullbright = v
+    StepFullbright()
+end)
+AddToggle(MiscTabPage, "Anti-Aim", function() return Config.Misc.AntiAim end, function(v)
+    Config.Misc.AntiAim = v
+    if not v then
+        StepAntiAim(0)
+    end
+end)
+AddCycle(MiscTabPage, "AA Mode", { "Spin", "Jitter", "Backwards", "Random" }, function() return Config.Misc.AntiAimMode end, function(v) Config.Misc.AntiAimMode = v end)
+AddSlider(MiscTabPage, "AA Spin Speed", 5, 45, 1, function() return Config.Misc.AntiAimSpeed end, function(v) Config.Misc.AntiAimSpeed = v end)
+AddCycle(MiscTabPage, "AA Pitch", { "Down", "Up", "Jitter", "Off" }, function() return Config.Misc.AntiAimPitch end, function(v) Config.Misc.AntiAimPitch = v end)
+AddToggle(MiscTabPage, "Potato Graphics (FPS)", function() return Config.Misc.PotatoGraphics end, function(v)
+    Config.Misc.PotatoGraphics = v
+    ApplyPotatoGraphics(v)
+end)
+AddToggle(MiscTabPage, "Long Jump", function() return Config.Misc.LongJump end, function(v) Config.Misc.LongJump = v end)
+AddSlider(MiscTabPage, "Long Jump Boost", 24, 90, 2, function() return Config.Misc.LongJumpBoost end, function(v) Config.Misc.LongJumpBoost = v end)
+AddSlider(MiscTabPage, "Long Jump Height", 35, 95, 2, function() return Config.Misc.LongJumpHeight end, function(v) Config.Misc.LongJumpHeight = v end)
 
 -- ============================================================================
 -- LIFECYCLE & RENDER STEP
@@ -2102,9 +2832,27 @@ end))
 InstallViewSpoof()
 InstallSilentHook()
 BindBowFlightListener()
+InstallTriggerBotHook()
+
+WatchWeaponContainer(LocalPlayer:FindFirstChildOfClass("Backpack"))
+if LocalPlayer.Character then
+    WatchWeaponContainer(LocalPlayer.Character)
+    BindLongJump(LocalPlayer.Character)
+end
+AddConn(LocalPlayer.CharacterAdded:Connect(function(char)
+    WatchWeaponContainer(char)
+    BindLongJump(char)
+    task.defer(function()
+        local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+        if bp then WatchWeaponContainer(bp) end
+        ApplyAllWeapons()
+    end)
+end))
 
 -- Bind at Last - 1 so CameraModule & SmoothLookPost run first and AimWatchLook runs after
 local STEP_NAME = "OcelHubRenderStep"
+local POST_BODY_NAME = "OcelHubPostBody"
+
 RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, function(dt)
     Camera = Workspace.CurrentCamera
     if not Camera then return end
@@ -2126,12 +2874,28 @@ RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, funct
     end
 
     StepAimbot(dt)
+    StepTriggerBot()
+    StepFullbright()
+    StepThirdPerson()
+    StepAntiAim(dt)
 
     if AimFloatBtn.Visible then
         local active = IsAimActive()
         AimFloatBtn.BackgroundColor3 = active and Theme.Accent or Theme.Bg
         AimFloatBtn.TextColor3 = active and Theme.Bg or Theme.Accent
         AimFloatStroke.Color = AimHasLock and Color3.fromRGB(90, 230, 130) or (active and Theme.Accent or Theme.Border)
+    end
+end)
+
+-- Runs after MovementClient's FirstPersonBody (Last.Value) so 3rd person character stays visible
+RunService:BindToRenderStep(POST_BODY_NAME, Enum.RenderPriority.Last.Value + 1, function()
+    if not Config.Misc.ThirdPerson then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    for _, inst in ipairs(char:GetDescendants()) do
+        if inst:IsA("BasePart") and inst.Name ~= "HumanoidRootPart" and inst.LocalTransparencyModifier ~= 0 then
+            inst.LocalTransparencyModifier = 0
+        end
     end
 end)
 
@@ -2146,7 +2910,9 @@ local function Unload()
         sharedRegistry._OcelOrigHeldView = nil
     end
 
+    RestoreAllMisc()
     pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
+    pcall(function() RunService:UnbindFromRenderStep(POST_BODY_NAME) end)
     for _, conn in ipairs(Connections) do
         pcall(function() conn:Disconnect() end)
     end
