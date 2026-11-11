@@ -889,7 +889,7 @@ local SilentState = {
     Active = false,
     Part = nil,
     Char = nil,
-    SuppressedClaims = {},
+    RealHitsSent = {},
     LastBowDraw = 1,
     BowCalibration = nil, -- { baseSpeed, gravity, drag }
 }
@@ -1104,18 +1104,35 @@ local function InstallSilentHook()
                             if type(claim) == "table" and type(claim.id) == "number" then
                                 local hitRemote = remFolder and remFolder:FindFirstChild("Hit")
                                 if hitRemote and hitRemote:IsA("RemoteEvent") then
-                                    SilentState.SuppressedClaims[claim.id] = os.clock() + 3
+                                    local claimId = claim.id
+                                    SilentState.RealHitsSent[claimId] = nil
                                     local speed = select(1, GetWeaponBallistics())
-                                    local delaySec = math.clamp((aimPos - origin).Magnitude / math.max(100, speed), 0.01, 0.75)
+                                    local baseDelay = math.clamp((aimPos - origin).Magnitude / math.max(100, speed), 0.015, 0.75)
+                                    local waitSec = (sMethod == "Hook") and baseDelay or (baseDelay + 0.05)
                                     local targetPart, targetChar = part, char
                                     local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
                                     local pellets = (tool and tonumber(tool:GetAttribute("C_Pellets"))) or 1
                                     pellets = math.clamp(math.floor(pellets), 1, 12)
-                                    task.delay(delaySec, function()
+                                    local isBatchHit = (folderName == "DoubleBarrelRemotes" or folderName == "PipePistolRemotes")
+
+                                    task.delay(waitSec, function()
+                                        if SilentState.RealHitsSent[claimId] then
+                                            SilentState.RealHitsSent[claimId] = nil
+                                            return
+                                        end
                                         if targetPart.Parent and targetChar.Parent and hitRemote.Parent then
                                             local nowT = Workspace:GetServerTimeNow()
-                                            for pIdx = 1, pellets do
-                                                hitRemote:FireServer(claim.id, pIdx, targetPart, targetPart.Position, nowT)
+                                            local hitPos = targetPart.Position
+                                            if isBatchHit then
+                                                local batch = {}
+                                                for pIdx = 1, pellets do
+                                                    table.insert(batch, { pIdx, targetPart, hitPos, nowT })
+                                                end
+                                                sendFn(hitRemote, claimId, batch)
+                                            else
+                                                for pIdx = 1, pellets do
+                                                    sendFn(hitRemote, claimId, pIdx, targetPart, hitPos, nowT)
+                                                end
                                             end
                                         end
                                     end)
@@ -1132,9 +1149,8 @@ local function InstallSilentHook()
 
             elseif name == "Hit" then
                 local claimId = ...
-                local exp = SilentState.SuppressedClaims[claimId]
-                if exp and os.clock() < exp then
-                    return nil
+                if type(claimId) == "number" then
+                    SilentState.RealHitsSent[claimId] = true
                 end
             end
         end
