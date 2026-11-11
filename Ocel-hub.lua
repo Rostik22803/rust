@@ -1004,13 +1004,26 @@ local function IsHoldingRangedWeapon()
     return nil, false
 end
 
+local GameShared = (type(getrenv) == "function" and getrenv().shared) or shared
+
+local RealFireServer
+do
+    local ok, fn = pcall(function()
+        local tmp = Instance.new("RemoteEvent")
+        local f = tmp.FireServer
+        tmp:Destroy()
+        return f
+    end)
+    RealFireServer = ok and fn or nil
+end
+
 local function InstallViewSpoof()
     local sharedRegistry = getgenv and getgenv() or _G
     if sharedRegistry._OcelOrigHeldView == nil then
-        sharedRegistry._OcelOrigHeldView = shared.HeldViewCFrame or false
+        sharedRegistry._OcelOrigHeldView = GameShared.HeldViewCFrame or false
     end
 
-    shared.HeldViewCFrame = function(camCF)
+    GameShared.HeldViewCFrame = function(camCF)
         local orig = sharedRegistry._OcelOrigHeldView
         local baseCF = (type(orig) == "function") and orig(camCF) or camCF
         if typeof(baseCF) ~= "CFrame" then
@@ -1046,41 +1059,46 @@ local function InstallSilentHook()
     local safeCheckCaller = type(checkcaller) == "function" and checkcaller or function() return false end
     local sharedRegistry = getgenv and getgenv() or _G
 
-    local function silentHandler(oldFn, self, ...)
+    local function silentHandler(sendFn, self, ...)
         local sMethod = Config.Aimbot.SilentMethod
-        if sMethod == "ViewSpoof" then
-            return oldFn(self, ...)
+        if sMethod == "ViewSpoof" or not Config.Aimbot.SilentAim or not SilentState.Active then
+            return sendFn(self, ...)
         end
 
-        if Config.Aimbot.SilentAim and SilentState.Active then
-            local part = SilentState.Part
-            local char = SilentState.Char
-            if part and part.Parent and char and char.Parent and typeof(self) == "Instance" then
-                local name = self.Name
-                local remFolder = self.Parent
-                local folderName = remFolder and remFolder.Name or ""
+        local part = SilentState.Part
+        local char = SilentState.Char
+        if part and part.Parent and char and char.Parent and typeof(self) == "Instance" then
+            local name = self.Name
+            local remFolder = self.Parent
+            local folderName = remFolder and remFolder.Name or ""
 
-                if name == "Fire" or name == "Launch" then
-                    local argc = select("#", ...)
-                    local args = { ... }
+            if name == "Fire" or name == "Launch" then
+                local argc = select("#", ...)
+                local args = { ... }
+                local redirected = false
 
-                    -- Bow / Crossbow / Blowpipe / Speargun: BowRemotes.Fire(dir, draw, hold, claim) or Launch(dir, claim)
-                    if (folderName == "BowRemotes" or (typeof(args[1]) == "Vector3" and typeof(args[2]) ~= "Vector3")) and typeof(args[1]) == "Vector3" then
-                        if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
-                            local draw = (name == "Fire" and type(args[2]) == "number") and math.clamp(args[2], 0.3, 1) or 1
-                            SilentState.LastBowDraw = draw
-                            local claim = (name == "Fire") and args[4] or args[2]
-                            local origin = (type(claim) == "table" and typeof(claim.o) == "Vector3") and claim.o or Camera.CFrame.Position
-                            args[1] = PredictBowDirection(origin, part, char, draw)
-                            return oldFn(self, table.unpack(args, 1, argc))
+                -- Bow / Crossbow / Blowpipe / Speargun: BowRemotes.Fire(dir, draw, hold, claim) or Launch(dir, claim)
+                if (folderName == "BowRemotes" or (typeof(args[1]) == "Vector3" and typeof(args[2]) ~= "Vector3")) and typeof(args[1]) == "Vector3" then
+                    if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
+                        local draw = (name == "Fire" and type(args[2]) == "number") and math.clamp(args[2], 0.3, 1) or 1
+                        SilentState.LastBowDraw = draw
+                        local claim = (name == "Fire") and args[4] or args[2]
+                        local origin = (type(claim) == "table" and typeof(claim.o) == "Vector3") and claim.o or Camera.CFrame.Position
+                        local ok, newDir = pcall(PredictBowDirection, origin, part, char, draw)
+                        if ok and typeof(newDir) == "Vector3" and newDir.Magnitude > 0.5 then
+                            args[1] = newDir
+                            redirected = true
                         end
+                    end
 
-                    -- Firearms / PipePistol / DoubleBarrel: Fire(origin, dir, ...)
-                    elseif typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
-                        if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
-                            local origin = args[1]
-                            local aimPos = PredictAimPosition(part, char)
+                -- Firearms / PipePistol / DoubleBarrel: Fire(origin, dir, ...)
+                elseif typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
+                    if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
+                        local origin = args[1]
+                        local ok, aimPos = pcall(PredictAimPosition, part, char)
+                        if ok and typeof(aimPos) == "Vector3" and (aimPos - origin).Magnitude > 0.5 then
                             args[2] = (aimPos - origin).Unit
+                            redirected = true
 
                             local claim = args[4]
                             if type(claim) == "table" and type(claim.id) == "number" then
@@ -1103,20 +1121,24 @@ local function InstallSilentHook()
                                     end)
                                 end
                             end
-                            return oldFn(self, table.unpack(args, 1, argc))
                         end
                     end
+                end
 
-                elseif name == "Hit" then
-                    local claimId = ...
-                    local exp = SilentState.SuppressedClaims[claimId]
-                    if exp and os.clock() < exp then
-                        return nil
-                    end
+                if redirected then
+                    return sendFn(self, table.unpack(args, 1, argc))
+                end
+                return sendFn(self, ...)
+
+            elseif name == "Hit" then
+                local claimId = ...
+                local exp = SilentState.SuppressedClaims[claimId]
+                if exp and os.clock() < exp then
+                    return nil
                 end
             end
         end
-        return oldFn(self, ...)
+        return sendFn(self, ...)
     end
 
     if sharedRegistry._OcelSilentHook then
@@ -1125,7 +1147,7 @@ local function InstallSilentHook()
         return
     end
 
-    local state = { handler = silentHandler, enabled = true, old = nil }
+    local state = { handler = silentHandler, enabled = true, old = nil, isHookFn = false }
     sharedRegistry._OcelSilentHook = state
 
     local hooked = false
@@ -1135,7 +1157,8 @@ local function InstallSilentHook()
                 local method = getnamecallmethod()
                 local old = state.old
                 if state.enabled and (method == "FireServer" or method == "fireServer") and not safeCheckCaller() then
-                    return state.handler(old, self, ...)
+                    -- Use unhooked RealFireServer so inner :FindFirstChild/:GetAttribute calls never corrupt getnamecallmethod()
+                    return state.handler(RealFireServer or old, self, ...)
                 end
                 return old(self, ...)
             end))
@@ -1144,12 +1167,10 @@ local function InstallSilentHook()
     end
 
     -- Fallback: hook RemoteEvent.FireServer directly if hookmetamethod is missing/broken
-    if not hooked and type(hookfunction) == "function" then
+    if not hooked and type(hookfunction) == "function" and RealFireServer then
         local ok = pcall(function()
-            local tmp = Instance.new("RemoteEvent")
-            local targetFn = tmp.FireServer
-            tmp:Destroy()
-            state.old = hookfunction(targetFn, wrap(function(self, ...)
+            state.isHookFn = true
+            state.old = hookfunction(RealFireServer, wrap(function(self, ...)
                 local old = state.old
                 if state.enabled and not safeCheckCaller() then
                     return state.handler(old, self, ...)
@@ -1178,7 +1199,7 @@ local function IsAimActive()
         end
         return AimButtonHeld
     else -- "ADS": works on Mobile ADS (TouchAiming / MouseDeltaSensitivity) AND PC RMB
-        if shared.TouchAiming == true or UserInputService.MouseDeltaSensitivity < 0.98 then
+        if GameShared.TouchAiming == true or UserInputService.MouseDeltaSensitivity < 0.98 then
             return true
         end
         if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
@@ -1432,11 +1453,11 @@ local function StepAimbot(dt)
     Camera.CFrame = nextCF
 
     -- Keep SmoothLookAim synced for AimWatchLook consistency
-    if type(shared.SmoothLookAim) == "table" then
+    if type(GameShared.SmoothLookAim) == "table" then
         local lv = nextCF.LookVector
-        shared.SmoothLookAim.yaw = math.atan2(-lv.X, -lv.Z)
-        shared.SmoothLookAim.pitch = math.asin(math.clamp(lv.Y, -1, 1))
-        shared.SmoothLookAim.at = os.clock()
+        GameShared.SmoothLookAim.yaw = math.atan2(-lv.X, -lv.Z)
+        GameShared.SmoothLookAim.pitch = math.asin(math.clamp(lv.Y, -1, 1))
+        GameShared.SmoothLookAim.at = os.clock()
     end
 end
 
@@ -2105,7 +2126,7 @@ local function Unload()
     end
     if sharedRegistry._OcelOrigHeldView ~= nil then
         local orig = sharedRegistry._OcelOrigHeldView
-        shared.HeldViewCFrame = (type(orig) == "function") and orig or nil
+        GameShared.HeldViewCFrame = (type(orig) == "function") and orig or nil
         sharedRegistry._OcelOrigHeldView = nil
     end
 
