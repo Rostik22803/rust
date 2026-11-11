@@ -43,6 +43,7 @@ local Config = {
         Weapon = true,
         HealthBar = true,
         HealthText = true,
+        PlayerCounter = true,       -- top HUD counter (online, nearby enemies, bots)
         IgnoreDowned = false,
         Colors = {
             Enemy = Color3.fromRGB(255, 72, 72),
@@ -101,9 +102,10 @@ local Config = {
         AntiAimSpeed = 22,          -- rad/s for Spin
         AntiAimPitch = "Down",      -- "Down" | "Up" | "Jitter" | "Off"
         PotatoGraphics = false,     -- FPS booster (smooth plastic, no grass/shadows/particles)
+        NoJumpCooldown = true,      -- bypasses JumpLimiter 1s cooldown
         LongJump = false,
-        LongJumpBoost = 44,         -- horizontal velocity (studs/s)
-        LongJumpHeight = 58,        -- vertical velocity (studs/s)
+        LongJumpBoost = 26,         -- safe horizontal velocity (studs/s, avoids server rubberband)
+        LongJumpHeight = 52,        -- vertical velocity (studs/s)
     },
     UI = {
         Open = not IsMobile,        -- on mobile start collapsed to clean OCEL pill
@@ -1768,6 +1770,47 @@ end
 -- Anti-Aim state
 local AntiAimYaw = 0
 local AntiAimAutoRotWasDisabled = false
+local MotorBackup = setmetatable({}, { __mode = "k" })
+
+local function RestoreAntiAimMotors(char)
+    if not char then return end
+    for _, desc in ipairs(char:GetDescendants()) do
+        if desc:IsA("Motor6D") and MotorBackup[desc] then
+            desc.C0 = MotorBackup[desc]
+        end
+    end
+end
+
+local function ApplyAntiAimPose(char)
+    if not char then return end
+    if not Config.Misc.AntiAim or Config.Misc.AntiAimPitch == "Off" then
+        RestoreAntiAimMotors(char)
+        return
+    end
+    local pMode = Config.Misc.AntiAimPitch
+    local pitchRad
+    if pMode == "Down" then
+        pitchRad = -1.22
+    elseif pMode == "Up" then
+        pitchRad = 1.15
+    else -- "Jitter"
+        pitchRad = (math.floor(os.clock() * 18) % 2 == 0) and -1.22 or 1.15
+    end
+
+    local head = char:FindFirstChild("Head")
+    local neck = head and head:FindFirstChild("Neck")
+    if neck and neck:IsA("Motor6D") then
+        if not MotorBackup[neck] then MotorBackup[neck] = neck.C0 end
+        neck.C0 = MotorBackup[neck] * CFrame.Angles(pitchRad, 0, 0)
+    end
+
+    local ut = char:FindFirstChild("UpperTorso")
+    local waist = ut and ut:FindFirstChild("Waist")
+    if waist and waist:IsA("Motor6D") then
+        if not MotorBackup[waist] then MotorBackup[waist] = waist.C0 end
+        waist.C0 = MotorBackup[waist] * CFrame.Angles(pitchRad * 0.42, 0, 0)
+    end
+end
 
 local function StepAntiAim(dt)
     local char = LocalPlayer.Character
@@ -1780,6 +1823,7 @@ local function StepAntiAim(dt)
             hum.AutoRotate = true
             AntiAimAutoRotWasDisabled = false
         end
+        RestoreAntiAimMotors(char)
         return
     end
 
@@ -1806,14 +1850,16 @@ local function StepAntiAim(dt)
 
     local pos = hrp.Position
     hrp.CFrame = CFrame.new(pos) * CFrame.Angles(0, AntiAimYaw, 0)
+    ApplyAntiAimPose(char)
 end
 
--- TriggerBot (Mobile + PC via TouchInput & mouse1 fallback)
+-- TriggerBot (Mobile + PC via TouchInput & Bow InputBegan hook)
 local TriggerBotPulse = false
 local TriggerHoverSince = nil
 local TriggerNextFireAt = 0
 local TouchInputMod = nil
 local OrigIsMouseBtnPressed = nil
+local TouchBeganList = nil
 
 local function InstallTriggerBotHook()
     if TouchInputMod then return end
@@ -1831,9 +1877,53 @@ local function InstallTriggerBotHook()
                     end
                     return OrigIsMouseBtnPressed(btn)
                 end
+
+                -- Extract TouchInput's inputBegan listener list (v_u_25) so BowClient shoots on TriggerBot
+                local getup = getupvalues or (debug and debug.getupvalues)
+                if type(getup) == "function" and type(mod.inputBegan) == "function" then
+                    for _, uv in pairs(getup(mod.inputBegan)) do
+                        if type(uv) == "table" and type(uv[1]) == "table" and type(uv[1].fn) == "function" then
+                            TouchBeganList = uv
+                            break
+                        end
+                    end
+                end
             end
         end
     end)
+end
+
+local function FireSyntheticBowShot()
+    local fakeInput = {
+        UserInputType = Enum.UserInputType.MouseButton1,
+        UserInputState = Enum.UserInputState.Begin,
+        KeyCode = Enum.KeyCode.Unknown,
+        Position = Vector3.zero,
+    }
+    if TouchBeganList then
+        for _, rec in ipairs(TouchBeganList) do
+            if type(rec) == "table" and type(rec.fn) == "function" then
+                task.spawn(pcall, rec.fn, fakeInput, false)
+            end
+        end
+        return true
+    end
+    if type(getconnections) == "function" then
+        local ok, conns = pcall(getconnections, UserInputService.InputBegan)
+        if ok and type(conns) == "table" then
+            for _, c in ipairs(conns) do
+                if c and c.Function then
+                    task.spawn(pcall, c.Function, fakeInput, false)
+                end
+            end
+            return true
+        end
+    end
+    if type(mouse1click) == "function" then
+        pcall(mouse1click)
+        return true
+    end
+    return false
 end
 
 local function IsValidTriggerModel(model)
@@ -1872,7 +1962,7 @@ local function StepTriggerBot()
         return
     end
     local tool, isBow = IsHoldingRangedWeapon()
-    if not tool or isBow then
+    if not tool then
         TriggerBotPulse = false
         TriggerHoverSince = nil
         return
@@ -1915,17 +2005,22 @@ local function StepTriggerBot()
             TriggerHoverSince = now
         end
         if (now - TriggerHoverSince) * 1000 >= Config.Aimbot.TriggerDelayMs then
-            TriggerNextFireAt = now + 0.11
-            if TouchInputMod then
-                TriggerBotPulse = true
-                task.delay(0.045, function()
-                    TriggerBotPulse = false
-                end)
-            elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
-                pcall(mouse1press)
-                task.delay(0.045, function()
-                    pcall(mouse1release)
-                end)
+            if isBow then
+                TriggerNextFireAt = now + 0.18
+                FireSyntheticBowShot()
+            else
+                TriggerNextFireAt = now + 0.11
+                if TouchInputMod then
+                    TriggerBotPulse = true
+                    task.delay(0.045, function()
+                        TriggerBotPulse = false
+                    end)
+                elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
+                    pcall(mouse1press)
+                    task.delay(0.045, function()
+                        pcall(mouse1release)
+                    end)
+                end
             end
         end
     else
@@ -2083,8 +2178,61 @@ local function ApplyPotatoGraphics(enable)
     end
 end
 
--- Long Jump (binds Humanoid.StateChanged so it works cleanly with JumpLimiter)
+-- Long Jump + No Jump Cooldown (bypasses JumpLimiter & uses controlled glide to avoid server rubberband)
 local LongJumpConn = nil
+local LongJumpUntil = 0
+local SavedJumpPower = 50
+local SavedJumpHeight = 7.2
+
+local function StepNoJumpCooldown()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local jl = char:FindFirstChild("JumpLimiter")
+
+    if Config.Misc.NoJumpCooldown then
+        if jl and jl:IsA("LocalScript") and not jl.Disabled then
+            jl.Disabled = true
+        end
+        if hum then
+            if hum.JumpPower > 0 then SavedJumpPower = hum.JumpPower end
+            if hum.JumpHeight > 0 then SavedJumpHeight = hum.JumpHeight end
+            if hum.JumpPower == 0 then hum.JumpPower = SavedJumpPower end
+            if hum.JumpHeight == 0 then hum.JumpHeight = SavedJumpHeight end
+        end
+    else
+        if jl and jl:IsA("LocalScript") and jl.Disabled then
+            jl.Disabled = false
+        end
+    end
+
+    -- Gentle airborne horizontal glide for LongJump (prevents single-frame velocity spikes / rubberbanding)
+    if Config.Misc.LongJump and hum and os.clock() < LongJumpUntil then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local state = hum:GetState()
+            if state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall then
+                local move = hum.MoveDirection
+                local horiz = move.Magnitude > 0.1 and Vector3.new(move.X, 0, move.Z).Unit or nil
+                if not horiz and Camera then
+                    local lv = Camera.CFrame.LookVector
+                    local flat = Vector3.new(lv.X, 0, lv.Z)
+                    if flat.Magnitude > 0.01 then horiz = flat.Unit end
+                end
+                if horiz then
+                    local cur = hrp.AssemblyLinearVelocity
+                    local targetXZ = horiz * Config.Misc.LongJumpBoost
+                    local blended = Vector3.new(cur.X, 0, cur.Z):Lerp(targetXZ, 0.45)
+                    local vy = math.max(cur.Y, -16)
+                    hrp.AssemblyLinearVelocity = Vector3.new(blended.X, vy, blended.Z)
+                end
+            else
+                LongJumpUntil = 0
+            end
+        end
+    end
+end
+
 local function BindLongJump(char)
     if LongJumpConn then
         pcall(function() LongJumpConn:Disconnect() end)
@@ -2099,6 +2247,7 @@ local function BindLongJump(char)
         if not Config.Misc.LongJump or newState ~= Enum.HumanoidStateType.Jumping then
             return
         end
+        LongJumpUntil = os.clock() + 0.34
         task.defer(function()
             if not hrp.Parent or not hum.Parent then return end
             local move = hum.MoveDirection
@@ -2114,9 +2263,9 @@ local function BindLongJump(char)
             end
             local cur = hrp.AssemblyLinearVelocity
             hrp.AssemblyLinearVelocity = Vector3.new(
-                horiz.X * Config.Misc.LongJumpBoost,
+                horiz.X * math.min(Config.Misc.LongJumpBoost, 34),
                 math.max(cur.Y, Config.Misc.LongJumpHeight),
-                horiz.Z * Config.Misc.LongJumpBoost
+                horiz.Z * math.min(Config.Misc.LongJumpBoost, 34)
             )
         end)
     end)
@@ -2139,7 +2288,11 @@ local function RestoreAllMisc()
     StepThirdPerson()
     Config.Misc.AntiAim = false
     StepAntiAim(0)
+    RestoreAntiAimMotors(LocalPlayer.Character)
+    Config.Misc.NoJumpCooldown = false
+    StepNoJumpCooldown()
     Config.Misc.LongJump = false
+    LongJumpUntil = 0
     if LongJumpConn then
         pcall(function() LongJumpConn:Disconnect() end)
         LongJumpConn = nil
@@ -2233,6 +2386,27 @@ local PillStroke = Instance.new("UIStroke", TogglePill)
 PillStroke.Color = Theme.Accent
 PillStroke.Thickness = 1.2
 PillStroke.Transparency = 0.35
+
+-- Monochrome Player Counter pill (top-center, draggable)
+local CounterPill = Instance.new("TextLabel")
+CounterPill.Size = UDim2.fromOffset(230, 26)
+CounterPill.Position = UDim2.new(0.5, -115, 0, 14)
+CounterPill.BackgroundColor3 = Theme.Bg
+CounterPill.BackgroundTransparency = 0.12
+CounterPill.BorderSizePixel = 0
+CounterPill.Font = Enum.Font.GothamBold
+CounterPill.TextSize = 11
+CounterPill.TextColor3 = Theme.Text
+CounterPill.Text = "PLAYERS: 0 · NEAR: 0 · BOTS: 0"
+CounterPill.Visible = Config.ESP.PlayerCounter
+CounterPill.Active = true
+CounterPill.Parent = GuiRoot
+Instance.new("UICorner", CounterPill).CornerRadius = UDim.new(1, 0)
+local CounterStroke = Instance.new("UIStroke", CounterPill)
+CounterStroke.Color = Theme.Border
+CounterStroke.Thickness = 1
+
+MakeDraggable(CounterPill, CounterPill, nil)
 
 -- Floating AIM button (shown when TriggerMode == "Button")
 local AimFloatBtn = Instance.new("TextButton")
@@ -2664,6 +2838,10 @@ AddToggle(ESPTabPage, "HP Bar", function() return Config.ESP.HealthBar end, func
 AddToggle(ESPTabPage, "Show Bots (Scientists)", function() return Config.ESP.ShowBots end, function(v) Config.ESP.ShowBots = v end)
 AddToggle(ESPTabPage, "Show Sleepers", function() return Config.ESP.ShowSleepers end, function(v) Config.ESP.ShowSleepers = v end)
 AddToggle(ESPTabPage, "Show Teammates", function() return Config.ESP.ShowTeammates end, function(v) Config.ESP.ShowTeammates = v end)
+AddToggle(ESPTabPage, "Player Counter", function() return Config.ESP.PlayerCounter end, function(v)
+    Config.ESP.PlayerCounter = v
+    CounterPill.Visible = v
+end)
 AddSlider(ESPTabPage, "Max Distance (studs)", 200, 2500, 50, function() return Config.ESP.MaxDistance end, function(v) Config.ESP.MaxDistance = v end)
 
 -- Populate Aimbot tab
@@ -2740,9 +2918,13 @@ AddToggle(MiscTabPage, "Potato Graphics (FPS)", function() return Config.Misc.Po
     Config.Misc.PotatoGraphics = v
     ApplyPotatoGraphics(v)
 end)
+AddToggle(MiscTabPage, "No Jump Cooldown", function() return Config.Misc.NoJumpCooldown end, function(v)
+    Config.Misc.NoJumpCooldown = v
+    StepNoJumpCooldown()
+end)
 AddToggle(MiscTabPage, "Long Jump", function() return Config.Misc.LongJump end, function(v) Config.Misc.LongJump = v end)
-AddSlider(MiscTabPage, "Long Jump Boost", 24, 90, 2, function() return Config.Misc.LongJumpBoost end, function(v) Config.Misc.LongJumpBoost = v end)
-AddSlider(MiscTabPage, "Long Jump Height", 35, 95, 2, function() return Config.Misc.LongJumpHeight end, function(v) Config.Misc.LongJumpHeight = v end)
+AddSlider(MiscTabPage, "Long Jump Boost", 20, 42, 1, function() return Config.Misc.LongJumpBoost end, function(v) Config.Misc.LongJumpBoost = v end)
+AddSlider(MiscTabPage, "Long Jump Height", 42, 68, 1, function() return Config.Misc.LongJumpHeight end, function(v) Config.Misc.LongJumpHeight = v end)
 
 -- ============================================================================
 -- LIFECYCLE & RENDER STEP
@@ -2852,6 +3034,49 @@ end))
 -- Bind at Last - 1 so CameraModule & SmoothLookPost run first and AimWatchLook runs after
 local STEP_NAME = "OcelHubRenderStep"
 local POST_BODY_NAME = "OcelHubPostBody"
+local LastCounterAt = 0
+
+local function UpdatePlayerCounter()
+    CounterPill.Visible = Config.ESP.PlayerCounter
+    if not Config.ESP.PlayerCounter or not Camera then return end
+    local now = os.clock()
+    if now - LastCounterAt < 0.2 then return end
+    LastCounterAt = now
+
+    local totalPlayers = math.max(0, #Players:GetPlayers() - 1)
+    local nearEnemies = 0
+    local nearBots = 0
+    local camPos = Camera.CFrame.Position
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and not IsTeammate(p) then
+            local c = p.Character
+            if c then
+                local r = c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("Head")
+                local hp, _, hasHp = GetModelHealth(c, false)
+                if r and hasHp and hp > 0 and c:GetAttribute("Dead") ~= true then
+                    if (r.Position - camPos).Magnitude <= Config.ESP.MaxDistance then
+                        nearEnemies = nearEnemies + 1
+                    end
+                end
+            end
+        end
+    end
+
+    for model, info in pairs(EntityPool) do
+        if info.kind == "Bot" and model.Parent then
+            local r = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+            local hp, _, hasHp = GetModelHealth(model, false)
+            if r and hasHp and hp > 0 and model:GetAttribute("Dead") ~= true then
+                if (r.Position - camPos).Magnitude <= Config.ESP.MaxDistance then
+                    nearBots = nearBots + 1
+                end
+            end
+        end
+    end
+
+    CounterPill.Text = string.format("PLAYERS: %d · NEAR: %d · BOTS: %d", totalPlayers, nearEnemies, nearBots)
+end
 
 RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, function(dt)
     Camera = Workspace.CurrentCamera
@@ -2878,6 +3103,8 @@ RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, funct
     StepFullbright()
     StepThirdPerson()
     StepAntiAim(dt)
+    StepNoJumpCooldown()
+    UpdatePlayerCounter()
 
     if AimFloatBtn.Visible then
         local active = IsAimActive()
@@ -2887,11 +3114,14 @@ RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, funct
     end
 end)
 
--- Runs after MovementClient's FirstPersonBody (Last.Value) so 3rd person character stays visible
+-- Runs after MovementClient's FirstPersonBody (Last.Value) so 3rd person character & head tilt stay applied
 RunService:BindToRenderStep(POST_BODY_NAME, Enum.RenderPriority.Last.Value + 1, function()
-    if not Config.Misc.ThirdPerson then return end
     local char = LocalPlayer.Character
     if not char then return end
+    if Config.Misc.AntiAim and Config.Misc.AntiAimPitch ~= "Off" then
+        ApplyAntiAimPose(char)
+    end
+    if not Config.Misc.ThirdPerson then return end
     for _, inst in ipairs(char:GetDescendants()) do
         if inst:IsA("BasePart") and inst.Name ~= "HumanoidRootPart" and inst.LocalTransparencyModifier ~= 0 then
             inst.LocalTransparencyModifier = 0
