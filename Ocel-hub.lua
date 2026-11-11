@@ -107,11 +107,13 @@ local Config = {
         LongJumpBoost = 26,         -- safe horizontal velocity (studs/s, avoids server rubberband)
         LongJumpHeight = 52,        -- vertical velocity (studs/s)
         SpeedBoost = false,
-        SpeedValue = 25,            -- studs/s (24-28 stays safe from server rubberband)
+        SpeedValue = 22,            -- studs/s (safe against server rollback with sprint sync)
         Noclip = false,
         Invisibility = false,
         InvisMode = "FE Sink",      -- "FE Sink" | "Local"
-        InvisSinkDepth = 15,        -- studs underground during network tick
+        InvisSinkDepth = 8,         -- studs underground during Heartbeat network window
+        Spider = false,
+        SpiderSpeed = 22,           -- vertical wall climb speed (studs/s)
     },
     UI = {
         Open = not IsMobile,        -- on mobile start collapsed to clean OCEL pill
@@ -2376,35 +2378,69 @@ local function BindLongJump(char)
 end
 
 local SpeedBoostActiveWasOn = false
+local SpeedSprintForced = false
+local CachedSprintRemote = nil
 
-local function StepSpeedBoost()
-    local char = LocalPlayer.Character
-    if not char then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hum or not hrp or hum.Health <= 0 then return end
+local function GetSprintRemote()
+    if CachedSprintRemote and CachedSprintRemote.Parent then
+        return CachedSprintRemote
+    end
+    local remotes = ReplicatedStorage:FindFirstChild("MovementRemotes")
+    local sprint = remotes and remotes:FindFirstChild("Sprint")
+    if sprint and sprint:IsA("RemoteEvent") then
+        CachedSprintRemote = sprint
+        return sprint
+    end
+    return nil
+end
 
-    if Config.Misc.SpeedBoost then
-        SpeedBoostActiveWasOn = true
-        hum.WalkSpeed = Config.Misc.SpeedValue
-        local move = hum.MoveDirection
-        if move.Magnitude > 0.1 then
-            local state = hum:GetState()
-            if state ~= Enum.HumanoidStateType.Jumping and state ~= Enum.HumanoidStateType.Freefall then
-                local cur = hrp.AssemblyLinearVelocity
-                local dir = Vector3.new(move.X, 0, move.Z).Unit
-                hrp.AssemblyLinearVelocity = Vector3.new(dir.X * Config.Misc.SpeedValue, cur.Y, dir.Z * Config.Misc.SpeedValue)
-            end
-        end
-    elseif SpeedBoostActiveWasOn then
-        SpeedBoostActiveWasOn = false
-        hum.WalkSpeed = 16
+local function SetSpeedSprint(state)
+    local remote = GetSprintRemote()
+    if remote and SpeedSprintForced ~= state then
+        SpeedSprintForced = state
+        pcall(function() remote:FireServer(state) end)
+    elseif not state then
+        SpeedSprintForced = false
     end
 end
 
--- Noclip
+local function StepSpeedBoost()
+    local char = LocalPlayer.Character
+    if not char then
+        SetSpeedSprint(false)
+        return
+    end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp or hum.Health <= 0 then
+        SetSpeedSprint(false)
+        return
+    end
+
+    if Config.Misc.SpeedBoost then
+        SpeedBoostActiveWasOn = true
+        -- Keep server Sprint flag active when moving so server uses sprint speed budget
+        if hum.MoveDirection.Magnitude > 0.1 and char:GetAttribute("Sprinting") ~= true then
+            SetSpeedSprint(true)
+        elseif hum.MoveDirection.Magnitude <= 0.1 and SpeedSprintForced then
+            SetSpeedSprint(false)
+        end
+        hum.WalkSpeed = Config.Misc.SpeedValue
+    elseif SpeedBoostActiveWasOn then
+        SpeedBoostActiveWasOn = false
+        hum.WalkSpeed = 16
+        SetSpeedSprint(false)
+    end
+end
+
+-- Noclip (disables both character collision & nearby torso-level walls while preserving floor)
 local NoclipBackup = setmetatable({}, { __mode = "k" })
+local WorldNoclipBackup = setmetatable({}, { __mode = "k" })
 local NoclipWasOn = false
+local NoclipOverlapParams = OverlapParams.new()
+NoclipOverlapParams.FilterType = Enum.RaycastFilterType.Exclude
+local NoclipRayParams = RaycastParams.new()
+NoclipRayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local function RestoreNoclip()
     for part, orig in pairs(NoclipBackup) do
@@ -2413,6 +2449,17 @@ local function RestoreNoclip()
         end
     end
     table.clear(NoclipBackup)
+    for part, orig in pairs(WorldNoclipBackup) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = orig end)
+        end
+    end
+    table.clear(WorldNoclipBackup)
+end
+
+local function IsCharacterPart(part)
+    local model = part:FindFirstAncestorOfClass("Model")
+    return model and model:FindFirstChildOfClass("Humanoid") ~= nil
 end
 
 local function StepNoclip()
@@ -2425,7 +2472,10 @@ local function StepNoclip()
         return
     end
     if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
     NoclipWasOn = true
+
     for _, inst in ipairs(char:GetDescendants()) do
         if inst:IsA("BasePart") then
             if NoclipBackup[inst] == nil then
@@ -2436,20 +2486,86 @@ local function StepNoclip()
             end
         end
     end
+
+    if not hrp or not hum then return end
+    NoclipRayParams.FilterDescendantsInstances = { char }
+    local floorDist = hum.HipHeight + hrp.Size.Y * 0.5 + 1.5
+    local floorHit = Workspace:Raycast(hrp.Position, Vector3.new(0, -floorDist, 0), NoclipRayParams)
+    local floorInst = floorHit and floorHit.Instance or nil
+
+    NoclipOverlapParams.FilterDescendantsInstances = { char, Workspace.Terrain }
+    local boxCenter = hrp.Position + Vector3.new(0, 1.35, 0)
+    local nearParts = Workspace:GetPartBoundsInBox(CFrame.new(boxCenter), Vector3.new(5.5, 3.6, 5.5), NoclipOverlapParams)
+    local seenNow = {}
+
+    for _, part in ipairs(nearParts) do
+        if part:IsA("BasePart") and part ~= floorInst and not IsCharacterPart(part) then
+            seenNow[part] = true
+            if WorldNoclipBackup[part] == nil then
+                if part.CanCollide then
+                    WorldNoclipBackup[part] = true
+                    part.CanCollide = false
+                end
+            elseif part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+
+    for part, orig in pairs(WorldNoclipBackup) do
+        if not seenNow[part] then
+            if part and part.Parent then
+                pcall(function() part.CanCollide = orig end)
+            end
+            WorldNoclipBackup[part] = nil
+        end
+    end
 end
 
--- Invisibility (FE Sink underground desync on Heartbeat->First, or Local visual)
+-- Spider (Wall Climb)
+local SpiderRayParams = RaycastParams.new()
+SpiderRayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function StepSpider()
+    if not Config.Misc.Spider then return end
+    local char = LocalPlayer.Character
+    if not char or char:GetAttribute("Downed") == true then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp or hum.Health <= 0 or hum.Sit or hum.SeatPart then return end
+
+    local move = hum.MoveDirection
+    local horiz = Vector3.new(move.X, 0, move.Z)
+    if horiz.Magnitude < 0.05 then return end
+    local dir = horiz.Unit
+
+    SpiderRayParams.FilterDescendantsInstances = { char }
+    local hit = Workspace:Raycast(hrp.Position, dir * 2.6, SpiderRayParams)
+        or Workspace:Raycast(hrp.Position + Vector3.new(0, 1.5, 0), dir * 2.6, SpiderRayParams)
+    if not hit then return end
+
+    local inst = hit.Instance
+    if not inst or (inst ~= Workspace.Terrain and not inst.CanCollide) then return end
+    if math.abs(hit.Normal.Y) < 0.65 and dir:Dot(-hit.Normal) > 0.15 then
+        local cur = hrp.AssemblyLinearVelocity
+        hrp.AssemblyLinearVelocity = Vector3.new(cur.X, Config.Misc.SpiderSpeed, cur.Z)
+    end
+end
+
+-- Invisibility (FE Sink underground desync on Heartbeat->Pre/Stepped, or Local visual)
 local InvisSavedCF = nil
+local InvisSunk = false
 local InvisWasOn = false
 
 local function RestoreInvis()
     local char = LocalPlayer.Character
-    if InvisSavedCF and char then
+    if InvisSunk and InvisSavedCF and char then
         local hrp = char:FindFirstChild("HumanoidRootPart")
         if hrp then
             hrp.CFrame = InvisSavedCF
         end
     end
+    InvisSunk = false
     InvisSavedCF = nil
     if InvisWasOn and char then
         InvisWasOn = false
@@ -2464,35 +2580,41 @@ local function RestoreInvis()
 end
 
 local function StepInvisPre()
+    if not InvisSunk or not InvisSavedCF then return end
     local char = LocalPlayer.Character
-    if not char then
-        InvisSavedCF = nil
-        return
-    end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if InvisSavedCF and hrp then
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
         hrp.CFrame = InvisSavedCF
     end
+    InvisSunk = false
     InvisSavedCF = nil
 end
 
 local function StepInvisPost()
     local char = LocalPlayer.Character
     if not Config.Misc.Invisibility then
-        if InvisWasOn or InvisSavedCF then
+        if InvisWasOn or InvisSunk or InvisSavedCF then
             RestoreInvis()
         end
         return
     end
-    if not char then return end
+    if not char then
+        InvisSunk = false
+        InvisSavedCF = nil
+        return
+    end
     InvisWasOn = true
 
-    if Config.Misc.InvisMode == "FE Sink" then
+    if Config.Misc.InvisMode == "FE Sink" and not InvisSunk then
         local hrp = char:FindFirstChild("HumanoidRootPart")
         local hum = char:FindFirstChildOfClass("Humanoid")
         if hrp and hum and hum.Health > 0 then
-            InvisSavedCF = hrp.CFrame
-            hrp.CFrame = InvisSavedCF * CFrame.new(0, -Config.Misc.InvisSinkDepth, 0)
+            local curCF = hrp.CFrame
+            local minSafeY = Workspace.FallenPartsDestroyHeight + 25
+            local targetY = math.max(curCF.Position.Y - Config.Misc.InvisSinkDepth, minSafeY)
+            InvisSavedCF = curCF
+            InvisSunk = true
+            hrp.CFrame = CFrame.new(curCF.Position.X, targetY, curCF.Position.Z) * (curCF - curCF.Position)
         end
     end
 end
@@ -2522,6 +2644,7 @@ local function RestoreAllMisc()
     StepSpeedBoost()
     Config.Misc.Noclip = false
     StepNoclip()
+    Config.Misc.Spider = false
     Config.Misc.Invisibility = false
     RestoreInvis()
     Config.Misc.NoJumpCooldown = false
@@ -3161,7 +3284,7 @@ AddToggle(MiscTabPage, "Speed Boost", function() return Config.Misc.SpeedBoost e
     Config.Misc.SpeedBoost = v
     if not v then StepSpeedBoost() end
 end)
-AddSlider(MiscTabPage, "Speed Value", 16, 42, 1, function() return Config.Misc.SpeedValue end, function(v) Config.Misc.SpeedValue = v end)
+AddSlider(MiscTabPage, "Speed Value", 16, 30, 0.5, function() return Config.Misc.SpeedValue end, function(v) Config.Misc.SpeedValue = v end)
 AddToggle(MiscTabPage, "Long Jump", function() return Config.Misc.LongJump end, function(v) Config.Misc.LongJump = v end)
 AddSlider(MiscTabPage, "Long Jump Boost", 20, 42, 1, function() return Config.Misc.LongJumpBoost end, function(v) Config.Misc.LongJumpBoost = v end)
 AddSlider(MiscTabPage, "Long Jump Height", 42, 68, 1, function() return Config.Misc.LongJumpHeight end, function(v) Config.Misc.LongJumpHeight = v end)
@@ -3169,6 +3292,8 @@ AddToggle(MiscTabPage, "Noclip", function() return Config.Misc.Noclip end, funct
     Config.Misc.Noclip = v
     if not v then RestoreNoclip() end
 end)
+AddToggle(MiscTabPage, "Spider (Wall Climb)", function() return Config.Misc.Spider end, function(v) Config.Misc.Spider = v end)
+AddSlider(MiscTabPage, "Spider Speed", 12, 30, 1, function() return Config.Misc.SpiderSpeed end, function(v) Config.Misc.SpiderSpeed = v end)
 AddToggle(MiscTabPage, "Invisibility", function() return Config.Misc.Invisibility end, function(v)
     Config.Misc.Invisibility = v
     if not v then RestoreInvis() end
@@ -3180,7 +3305,7 @@ AddCycle(MiscTabPage, "Invis Mode", { "FE Sink", "Local" }, function() return Co
         Config.Misc.Invisibility = true
     end
 end)
-AddSlider(MiscTabPage, "Invis Sink Depth", 5, 35, 1, function() return Config.Misc.InvisSinkDepth end, function(v) Config.Misc.InvisSinkDepth = v end)
+AddSlider(MiscTabPage, "Invis Sink Depth", 4, 24, 1, function() return Config.Misc.InvisSinkDepth end, function(v) Config.Misc.InvisSinkDepth = v end)
 
 -- ============================================================================
 -- LIFECYCLE & RENDER STEP
@@ -3278,6 +3403,10 @@ if LocalPlayer.Character then
     BindLongJump(LocalPlayer.Character)
 end
 AddConn(LocalPlayer.CharacterAdded:Connect(function(char)
+    InvisSunk = false
+    InvisSavedCF = nil
+    SpeedSprintForced = false
+    RestoreNoclip()
     WatchWeaponContainer(char)
     BindLongJump(char)
     task.defer(function()
@@ -3377,7 +3506,10 @@ RunService:BindToRenderStep(PRE_INVIS_NAME, Enum.RenderPriority.First.Value, Ste
 AddConn(RunService.Heartbeat:Connect(StepInvisPost))
 
 AddConn(RunService.Stepped:Connect(function()
+    StepInvisPre()
+    StepSpeedBoost()
     StepNoclip()
+    StepSpider()
     if Config.Misc.AntiAim and Config.Misc.AntiAimPitch ~= "Off" and LocalPlayer.Character then
         ApplyAntiAimPose(LocalPlayer.Character)
     end
