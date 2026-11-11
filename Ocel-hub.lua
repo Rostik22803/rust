@@ -34,7 +34,8 @@ local Config = {
         BoxFill = true,
         BoxFillAlpha = 0.10,
         Skeleton = true,
-        SkeletonThickness = 1.6,
+        SkeletonThickness = 1.5,
+        SkeletonMinHeight = 34,     -- hide skeleton when box height < 34px so distant targets stay clean
         HeadDot = false,
         Name = true,
         Distance = true,
@@ -60,6 +61,9 @@ local Config = {
     },
     Aimbot = {
         Enabled = true,
+        SilentAim = true,           -- redirects shots inside FOV without snapping camera
+        SilentHitChance = 100,      -- % of shots redirected
+        SilentSnapline = true,      -- draws subtle line to locked silent target
         TriggerMode = IsMobile and "Button" or "ADS", -- "Button" | "ADS" | "Always"
         ButtonMode = "Hold",        -- "Hold" | "Toggle" (for floating AIM button)
         FOV = 135,                  -- pixels radius
@@ -575,55 +579,84 @@ local function RenderModelESP(entry, char, opts)
         end
     end
 
-    if Config.ESP.Skeleton and h >= 10 then
-        local isR15 = char:FindFirstChild("UpperTorso") ~= nil
-        local bones = (isR15 and (h >= 28 and R15_BONES or R15_LOD_BONES)) or R6_BONES
-        local distScale = math.clamp(h / 72, 0.55, 1)
-        local thick = math.max(0.9, Config.ESP.SkeletonThickness * distScale)
-        local useOutline = (h >= 34)
-        local outlineThick = thick + (h >= 55 and 1.8 or 1.0)
-        local projCache = {}
+    if Config.ESP.Skeleton and h >= Config.ESP.SkeletonMinHeight then
+        local ut = char:FindFirstChild("UpperTorso")
+        local lt = char:FindFirstChild("LowerTorso")
+        local thick = math.max(1.0, Config.ESP.SkeletonThickness * math.clamp(h / 75, 0.7, 1))
+        local useOutline = (h >= 54)
+        local outlineThick = thick + 1.6
+        local segs = {}
 
-        for i = 1, #entry.Skeleton do
-            local pair = bones[i]
-            if pair then
+        if ut and lt and ut:IsA("BasePart") and lt:IsA("BasePart") then
+            local utCF, utSz = ut.CFrame, ut.Size
+            local ltCF, ltSz = lt.CFrame, lt.Size
+            local neck = utCF:PointToWorldSpace(Vector3.new(0, utSz.Y * 0.45, 0))
+            local pelvis = ltCF:PointToWorldSpace(Vector3.new(0, -ltSz.Y * 0.25, 0))
+            local lShoulder = utCF:PointToWorldSpace(Vector3.new(-utSz.X * 0.48, utSz.Y * 0.34, 0))
+            local rShoulder = utCF:PointToWorldSpace(Vector3.new( utSz.X * 0.48, utSz.Y * 0.34, 0))
+            local lHip = ltCF:PointToWorldSpace(Vector3.new(-ltSz.X * 0.34, -ltSz.Y * 0.28, 0))
+            local rHip = ltCF:PointToWorldSpace(Vector3.new( ltSz.X * 0.34, -ltSz.Y * 0.28, 0))
+
+            local function pPos(name)
+                local p = char:FindFirstChild(name)
+                return (p and p:IsA("BasePart")) and p.Position or nil
+            end
+
+            local headPos = pPos("Head")
+            local lElbow = pPos("LeftLowerArm") or pPos("LeftUpperArm")
+            local lHand = pPos("LeftHand") or lElbow
+            local rElbow = pPos("RightLowerArm") or pPos("RightUpperArm")
+            local rHand = pPos("RightHand") or rElbow
+            local lKnee = pPos("LeftLowerLeg") or pPos("LeftUpperLeg")
+            local lFoot = pPos("LeftFoot") or lKnee
+            local rKnee = pPos("RightLowerLeg") or pPos("RightUpperLeg")
+            local rFoot = pPos("RightFoot") or rKnee
+
+            if headPos then table.insert(segs, { headPos, neck }) end
+            table.insert(segs, { neck, pelvis })
+            table.insert(segs, { neck, lShoulder })
+            table.insert(segs, { neck, rShoulder })
+            if lElbow then table.insert(segs, { lShoulder, lElbow }) end
+            if lElbow and lHand and lHand ~= lElbow then table.insert(segs, { lElbow, lHand }) end
+            if rElbow then table.insert(segs, { rShoulder, rElbow }) end
+            if rElbow and rHand and rHand ~= rElbow then table.insert(segs, { rElbow, rHand }) end
+            table.insert(segs, { pelvis, lHip })
+            table.insert(segs, { pelvis, rHip })
+            if lKnee then table.insert(segs, { lHip, lKnee }) end
+            if lKnee and lFoot and lFoot ~= lKnee then table.insert(segs, { lKnee, lFoot }) end
+            if rKnee then table.insert(segs, { rHip, rKnee }) end
+            if rKnee and rFoot and rFoot ~= rKnee then table.insert(segs, { rKnee, rFoot }) end
+        else
+            for _, pair in ipairs(R6_BONES) do
                 local pA = char:FindFirstChild(pair[1])
                 local pB = char:FindFirstChild(pair[2])
                 if pA and pB and pA:IsA("BasePart") and pB:IsA("BasePart") then
-                    local cA = projCache[pair[1]]
-                    if not cA then
-                        local pos, z = ProjectPoint(pA.Position)
-                        cA = { pos = pos, z = z }
-                        projCache[pair[1]] = cA
-                    end
-                    local cB = projCache[pair[2]]
-                    if not cB then
-                        local pos, z = ProjectPoint(pB.Position)
-                        cB = { pos = pos, z = z }
-                        projCache[pair[2]] = cB
-                    end
+                    table.insert(segs, { pA.Position, pB.Position })
+                end
+            end
+        end
 
-                    if cA.z > 0.2 and cB.z > 0.2 then
-                        if useOutline then
-                            local ol = entry.SkeletonOutline[i]
-                            ol.From = cA.pos
-                            ol.To = cB.pos
-                            ol.Thickness = outlineThick
-                            ol.Visible = true
-                        else
-                            entry.SkeletonOutline[i].Visible = false
-                        end
-
-                        local ln = entry.Skeleton[i]
-                        ln.From = cA.pos
-                        ln.To = cB.pos
-                        ln.Color = skelColor
-                        ln.Thickness = thick
-                        ln.Visible = true
+        for i = 1, #entry.Skeleton do
+            local seg = segs[i]
+            if seg then
+                local posA, zA = ProjectPoint(seg[1])
+                local posB, zB = ProjectPoint(seg[2])
+                if zA > 0.2 and zB > 0.2 then
+                    if useOutline then
+                        local ol = entry.SkeletonOutline[i]
+                        ol.From = posA
+                        ol.To = posB
+                        ol.Thickness = outlineThick
+                        ol.Visible = true
                     else
                         entry.SkeletonOutline[i].Visible = false
-                        entry.Skeleton[i].Visible = false
                     end
+                    local ln = entry.Skeleton[i]
+                    ln.From = posA
+                    ln.To = posB
+                    ln.Color = skelColor
+                    ln.Thickness = thick
+                    ln.Visible = true
                 else
                     entry.SkeletonOutline[i].Visible = false
                     entry.Skeleton[i].Visible = false
@@ -847,6 +880,104 @@ local FOVCircle = NewDraw("Circle", {
     Visible = false, Filled = false, Thickness = 1.2, NumSides = 64, Color = Config.Aimbot.FOVColor,
 })
 
+local SilentSnapline = NewDraw("Line", {
+    Visible = false, Thickness = 1.2, Transparency = 0.7, Color = Color3.fromRGB(255, 255, 255),
+})
+
+local SilentState = {
+    Active = false,
+    Part = nil,
+    Char = nil,
+    SuppressedClaims = {},
+}
+
+local PredictAimPosition
+
+local function InstallSilentHook()
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
+        return
+    end
+
+    local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
+    local sharedRegistry = getgenv and getgenv() or _G
+
+    local function silentHandler(oldNamecall, self, ...)
+        local method = getnamecallmethod()
+        if method == "FireServer" and Config.Aimbot.SilentAim and SilentState.Active then
+            local part = SilentState.Part
+            local char = SilentState.Char
+            if part and part.Parent and char and char.Parent and typeof(self) == "Instance" then
+                local name = self.Name
+                if name == "Fire" then
+                    local args = { ... }
+                    if typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
+                        if math.random(1, 100) <= Config.Aimbot.SilentHitChance then
+                            local origin = args[1]
+                            local aimPos = PredictAimPosition(part, char)
+                            args[2] = (aimPos - origin).Unit
+
+                            local claim = args[4]
+                            if type(claim) == "table" and type(claim.id) == "number" then
+                                local remFolder = self.Parent
+                                local hitRemote = remFolder and remFolder:FindFirstChild("Hit")
+                                if hitRemote and hitRemote:IsA("RemoteEvent") then
+                                    SilentState.SuppressedClaims[claim.id] = os.clock() + 3
+                                    local speed = select(1, GetWeaponBallistics())
+                                    local delaySec = math.clamp((aimPos - origin).Magnitude / math.max(100, speed), 0.01, 0.75)
+                                    local targetPart, targetChar = part, char
+                                    local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                                    local pellets = (tool and tonumber(tool:GetAttribute("C_Pellets"))) or 1
+                                    pellets = math.clamp(math.floor(pellets), 1, 12)
+                                    task.delay(delaySec, function()
+                                        if targetPart.Parent and targetChar.Parent and hitRemote.Parent then
+                                            local nowT = Workspace:GetServerTimeNow()
+                                            for pIdx = 1, pellets do
+                                                hitRemote:FireServer(claim.id, pIdx, targetPart, targetPart.Position, nowT)
+                                            end
+                                        end
+                                    end)
+                                end
+                            end
+                            return oldNamecall(self, table.unpack(args))
+                        end
+                    end
+                elseif name == "Hit" then
+                    local claimId = ...
+                    local exp = SilentState.SuppressedClaims[claimId]
+                    if exp and os.clock() < exp then
+                        return nil
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end
+
+    -- Avoid stacking hookmetamethod across re-executions
+    if sharedRegistry._OcelSilentHook then
+        sharedRegistry._OcelSilentHook.handler = silentHandler
+        sharedRegistry._OcelSilentHook.enabled = true
+        return
+    end
+
+    local state = { handler = silentHandler, enabled = true }
+    sharedRegistry._OcelSilentHook = state
+
+    local ok, oldNc = pcall(function()
+        local old
+        old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            if state.enabled and not checkcaller() then
+                return state.handler(old, self, ...)
+            end
+            return old(self, ...)
+        end))
+        return old
+    end)
+    if not ok then
+        sharedRegistry._OcelSilentHook = nil
+    end
+end
+
 local function IsAimActive()
     if not Config.Aimbot.Enabled then
         return false
@@ -945,7 +1076,7 @@ local function IsValidTargetEntry(target, screenCenter, fovRadius)
     return nil
 end
 
-local function PredictAimPosition(part, char)
+PredictAimPosition = function(part, char)
     local targetPos = part.Position
     if not Config.Aimbot.Prediction and not Config.Aimbot.GravityComp then
         return targetPos
@@ -1021,8 +1152,9 @@ end
 local function StepAimbot(dt)
     local vp = Camera.ViewportSize
     local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+    local anyAimOn = Config.Aimbot.Enabled or Config.Aimbot.SilentAim
 
-    if Config.Aimbot.Enabled and Config.Aimbot.ShowFOV then
+    if anyAimOn and Config.Aimbot.ShowFOV then
         FOVCircleOutline.Position = screenCenter
         FOVCircleOutline.Radius = Config.Aimbot.FOV
         FOVCircleOutline.Visible = true
@@ -1036,13 +1168,43 @@ local function StepAimbot(dt)
         FOVCircle.Visible = false
     end
 
+    local _, part, char = nil, nil, nil
+    if anyAimOn then
+        _, part, char = PickAimTarget(screenCenter)
+    end
+
+    -- Silent Aim state updates continuously whenever SilentAim is enabled
+    if Config.Aimbot.SilentAim and part and char then
+        SilentState.Active = true
+        SilentState.Part = part
+        SilentState.Char = char
+        if Config.Aimbot.SilentSnapline then
+            local sp, z = ProjectPoint(part.Position)
+            if z > 0.2 then
+                SilentSnapline.From = screenCenter
+                SilentSnapline.To = sp
+                SilentSnapline.Visible = true
+            else
+                SilentSnapline.Visible = false
+            end
+        else
+            SilentSnapline.Visible = false
+        end
+    else
+        SilentState.Active = false
+        SilentState.Part = nil
+        SilentState.Char = nil
+        SilentSnapline.Visible = false
+    end
+
     if not IsAimActive() then
-        LockedTarget = nil
+        if not Config.Aimbot.SilentAim then
+            LockedTarget = nil
+        end
         AimHasLock = false
         return
     end
 
-    local _, part, char = PickAimTarget(screenCenter)
     if not part or not char then
         AimHasLock = false
         return
@@ -1068,7 +1230,6 @@ local function StepAimbot(dt)
         alpha = 1
     else
         local baseAlpha = 1 - math.exp(-(60 / Config.Aimbot.Smoothness) * dt * 0.55)
-        -- Boost micro-angle tracking so distant targets don't lag behind SmoothLookClient
         if angle < 0.035 then
             baseAlpha = math.max(baseAlpha, 0.55)
         end
@@ -1583,6 +1744,7 @@ AddToggle(ESPTabPage, "Boxes", function() return Config.ESP.Box end, function(v)
 AddCycle(ESPTabPage, "Box Style", { "Corners", "Full" }, function() return Config.ESP.BoxStyle end, function(v) Config.ESP.BoxStyle = v end)
 AddToggle(ESPTabPage, "Box Fill", function() return Config.ESP.BoxFill end, function(v) Config.ESP.BoxFill = v end)
 AddToggle(ESPTabPage, "Skeletons", function() return Config.ESP.Skeleton end, function(v) Config.ESP.Skeleton = v end)
+AddSlider(ESPTabPage, "Skeleton Min Height (px)", 12, 80, 2, function() return Config.ESP.SkeletonMinHeight end, function(v) Config.ESP.SkeletonMinHeight = v end)
 AddToggle(ESPTabPage, "Head Dot", function() return Config.ESP.HeadDot end, function(v) Config.ESP.HeadDot = v end)
 AddToggle(ESPTabPage, "Names & Status", function() return Config.ESP.Name end, function(v) Config.ESP.Name = v end)
 AddToggle(ESPTabPage, "Distance (m)", function() return Config.ESP.Distance end, function(v) Config.ESP.Distance = v end)
@@ -1594,6 +1756,9 @@ AddToggle(ESPTabPage, "Show Teammates", function() return Config.ESP.ShowTeammat
 AddSlider(ESPTabPage, "Max Distance (studs)", 200, 2500, 50, function() return Config.ESP.MaxDistance end, function(v) Config.ESP.MaxDistance = v end)
 
 -- Populate Aimbot tab
+AddToggle(AimTabPage, "Silent Aim", function() return Config.Aimbot.SilentAim end, function(v) Config.Aimbot.SilentAim = v end)
+AddToggle(AimTabPage, "Silent Snapline", function() return Config.Aimbot.SilentSnapline end, function(v) Config.Aimbot.SilentSnapline = v end)
+AddSlider(AimTabPage, "Silent Hit Chance (%)", 10, 100, 5, function() return Config.Aimbot.SilentHitChance end, function(v) Config.Aimbot.SilentHitChance = v end)
 AddToggle(AimTabPage, "Aimbot Enabled", function() return Config.Aimbot.Enabled end, function(v)
     Config.Aimbot.Enabled = v
     SyncAimFloatVisibility()
@@ -1709,6 +1874,8 @@ AddConn(UserInputService.InputBegan:Connect(function(input, gp)
     end
 end))
 
+InstallSilentHook()
+
 -- Bind at Last - 1 so CameraModule & SmoothLookPost run first and AimWatchLook runs after
 local STEP_NAME = "OcelHubRenderStep"
 RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, function(dt)
@@ -1742,6 +1909,11 @@ RunService:BindToRenderStep(STEP_NAME, Enum.RenderPriority.Last.Value - 1, funct
 end)
 
 local function Unload()
+    local sharedRegistry = getgenv and getgenv() or _G
+    if sharedRegistry._OcelSilentHook then
+        sharedRegistry._OcelSilentHook.enabled = false
+    end
+
     pcall(function() RunService:UnbindFromRenderStep(STEP_NAME) end)
     for _, conn in ipairs(Connections) do
         pcall(function() conn:Disconnect() end)
@@ -1761,6 +1933,7 @@ local function Unload()
 
     pcall(function() FOVCircleOutline:Remove() end)
     pcall(function() FOVCircle:Remove() end)
+    pcall(function() SilentSnapline:Remove() end)
     pcall(function() GuiRoot:Destroy() end)
 
     if getgenv and getgenv()._OcelHubUnload == Unload then
